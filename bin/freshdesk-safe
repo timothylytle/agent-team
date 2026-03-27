@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+CONFIG_FILE="$HOME/.config/freshdesk/config.json"
+LOG_DIR="$HOME/.local/log/freshdesk-safe"
+LOG_FILE="$LOG_DIR/audit.log"
+NONCE_DIR="$LOG_DIR/nonces"
+
+# --- Logging ---
+
+init_log() {
+  mkdir -p "$LOG_DIR" || { echo "FATAL: cannot create log directory $LOG_DIR" >&2; exit 1; }
+  mkdir -p "$NONCE_DIR" || { echo "FATAL: cannot create nonce directory $NONCE_DIR" >&2; exit 1; }
+  if ! touch "$LOG_FILE" 2>/dev/null; then
+    echo "FATAL: cannot write to $LOG_FILE" >&2
+    exit 1
+  fi
+  # Clean up expired nonce files (older than 5 minutes)
+  find "$NONCE_DIR" -name '*.json' -mmin +5 -delete 2>/dev/null || true
+}
+
+log_entry() {
+  local cmd="$1" decision="$2" exit_code="${3:-null}"
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cmd="${cmd//\\/\\\\}"
+  cmd="${cmd//\"/\\\"}"
+  printf '{"timestamp":"%s","command":"%s","decision":"%s","exit_code":%s}\n' \
+    "$ts" "$cmd" "$decision" "$exit_code" >> "$LOG_FILE"
+}
+
+deny() {
+  local reason="$1"
+  log_entry "$CMD_STR" "BLOCKED"
+  echo "freshdesk-safe: BLOCKED — $reason" >&2
+  exit 1
+}
+
+# --- Credential Loading ---
+
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "freshdesk-safe: FATAL — config file not found: $CONFIG_FILE" >&2
+    echo "Expected JSON with fields: domain, api_key" >&2
+    exit 1
+  fi
+
+  if ! command -v jq &>/dev/null; then
+    echo "freshdesk-safe: FATAL — jq is required but not found" >&2
+    exit 1
+  fi
+
+  FD_DOMAIN=$(jq -r '.domain // empty' "$CONFIG_FILE" 2>/dev/null) || true
+  FD_API_KEY=$(jq -r '.api_key // empty' "$CONFIG_FILE" 2>/dev/null) || true
+
+  if [[ -z "${FD_DOMAIN:-}" || -z "${FD_API_KEY:-}" ]]; then
+    echo "freshdesk-safe: FATAL — config file missing required fields (domain, api_key)" >&2
+    exit 1
+  fi
+
+  BASE_URL="https://${FD_DOMAIN}.freshdesk.com/api/v2"
+}
+
+# --- Nonce Functions ---
+
+generate_nonce() {
+  head -c 4 /dev/urandom | xxd -p
+}
+
+save_nonce() {
+  local nonce="$1" cmd="$2"
+  local ts expires
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  expires=$(date -u -d "+5 minutes" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -v+5M +"%Y-%m-%dT%H:%M:%SZ")
+  local cmd_escaped="${cmd//\\/\\\\}"
+  cmd_escaped="${cmd_escaped//\"/\\\"}"
+  printf '{"nonce":"%s","cmd":"%s","ts":"%s","expires":"%s"}\n' \
+    "$nonce" "$cmd_escaped" "$ts" "$expires" > "$NONCE_DIR/$nonce.json"
+}
+
+verify_nonce() {
+  local nonce="$1" current_cmd="$2"
+
+  [[ "$nonce" =~ ^[a-f0-9]+$ ]] || deny "invalid nonce format"
+
+  local nonce_file="$NONCE_DIR/$nonce.json"
+
+  if [[ ! -f "$nonce_file" ]]; then
+    log_entry "$CMD_STR" "BLOCKED"
+    echo "freshdesk-safe: BLOCKED — invalid or expired nonce" >&2
+    exit 1
+  fi
+
+  local stored_cmd stored_expires
+  { read -r stored_cmd; read -r stored_expires; } < <(python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d['cmd'])
+print(d['expires'])
+" < "$nonce_file")
+
+  local now_epoch expires_epoch
+  now_epoch=$(date -u +%s)
+  expires_epoch=$(date -u -d "$stored_expires" +%s 2>/dev/null \
+    || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$stored_expires" +%s)
+  if (( now_epoch > expires_epoch )); then
+    rm -f "$nonce_file"
+    log_entry "$CMD_STR" "BLOCKED"
+    echo "freshdesk-safe: BLOCKED — nonce expired" >&2
+    exit 1
+  fi
+
+  if [[ "$current_cmd" != "$stored_cmd" ]]; then
+    log_entry "$CMD_STR" "BLOCKED"
+    echo "freshdesk-safe: BLOCKED — command does not match dry-run" >&2
+    exit 1
+  fi
+
+  # Valid — delete nonce file (one-time use)
+  rm -f "$nonce_file"
+}
+
+# --- API Call ---
+
+api_call() {
+  local method="$1" endpoint="$2"
+  shift 2
+  local -a curl_args=("$@")
+
+  local url="${BASE_URL}${endpoint}"
+  local http_code body tmpfile header_file auth_file
+
+  tmpfile=$(mktemp)
+  header_file=$(mktemp)
+  auth_file=$(mktemp)
+  chmod 600 "$auth_file"
+  echo "-u \"${FD_API_KEY}:X\"" > "$auth_file"
+  trap "rm -f '$tmpfile' '$header_file' '$auth_file'" RETURN
+
+  http_code=$(curl -s -o "$tmpfile" -w '%{http_code}' \
+    -D "$header_file" \
+    -X "$method" \
+    --config "$auth_file" \
+    -H "Content-Type: application/json" \
+    "${curl_args[@]}" \
+    "$url") || {
+    echo "freshdesk-safe: ERROR — network failure or curl error" >&2
+    return 1
+  }
+
+  body=$(<"$tmpfile")
+
+  case "$http_code" in
+    2[0-9][0-9])
+      if command -v jq &>/dev/null; then
+        echo "$body" | jq .
+      else
+        echo "$body"
+      fi
+      return 0
+      ;;
+    401)
+      echo "freshdesk-safe: ERROR — 401 Unauthorized (check your API key)" >&2
+      echo "$body" >&2
+      return 1
+      ;;
+    403)
+      echo "freshdesk-safe: ERROR — 403 Forbidden (insufficient permissions)" >&2
+      echo "$body" >&2
+      return 1
+      ;;
+    429)
+      local retry_after=""
+      retry_after=$(grep -i '^retry-after:' "$header_file" | awk '{print $2}' | tr -d '\r') || true
+      echo "freshdesk-safe: ERROR — 429 Rate Limited" >&2
+      if [[ -n "$retry_after" ]]; then
+        echo "Retry-After: ${retry_after} seconds" >&2
+      fi
+      echo "$body" >&2
+      return 1
+      ;;
+    *)
+      echo "freshdesk-safe: ERROR — HTTP $http_code" >&2
+      echo "$body" >&2
+      return 1
+      ;;
+  esac
+}
+
+# --- Command Handlers ---
+
+cmd_tickets_list() {
+  local -a params=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --page)      params+=("page=$2"); shift 2 ;;
+      --per_page)  params+=("per_page=$2"); shift 2 ;;
+      --filter)    params+=("filter=$2"); shift 2 ;;
+      *)           deny "unknown option for tickets list: $1" ;;
+    esac
+  done
+
+  local endpoint="/tickets"
+  if (( ${#params[@]} > 0 )); then
+    local query_string
+    query_string=$(IFS='&'; echo "${params[*]}")
+    endpoint="/tickets?${query_string}"
+  fi
+
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  api_call GET "$endpoint" || rc=$?
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
+cmd_tickets_view() {
+  if (( $# < 1 )); then
+    deny "tickets view requires a ticket ID"
+  fi
+
+  local ticket_id="$1"; shift
+  [[ -z "$ticket_id" ]] && deny "ticket ID must not be empty"
+  [[ "$ticket_id" =~ ^[0-9]+$ ]] || deny "ticket ID must be numeric"
+
+  local include=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --include)  include="$2"; shift 2 ;;
+      *)          deny "unknown option for tickets view: $1" ;;
+    esac
+  done
+
+  local endpoint="/tickets/${ticket_id}"
+  if [[ -n "$include" ]]; then
+    endpoint="/tickets/${ticket_id}?include=${include}"
+  fi
+
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  api_call GET "$endpoint" || rc=$?
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
+cmd_tickets_search() {
+  local query=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --query)  query="$2"; shift 2 ;;
+      *)        deny "unknown option for tickets search: $1" ;;
+    esac
+  done
+
+  if [[ -z "$query" ]]; then
+    deny "tickets search requires --query"
+  fi
+
+  local encoded_query
+  encoded_query=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
+  local endpoint="/search/tickets?query=%22${encoded_query}%22"
+
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  api_call GET "$endpoint" || rc=$?
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
+cmd_tickets_note() {
+  if (( $# < 1 )); then
+    deny "tickets note requires a ticket ID"
+  fi
+
+  local ticket_id="$1"; shift
+  [[ -z "$ticket_id" ]] && deny "ticket ID must not be empty"
+  [[ "$ticket_id" =~ ^[0-9]+$ ]] || deny "ticket ID must be numeric"
+
+  local body=""
+  local private="true"
+  local confirmed_nonce=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --body)       body="$2"; shift 2 ;;
+      --private)    private="$2"; shift 2 ;;
+      --confirmed)  confirmed_nonce="$2"; shift 2 ;;
+      *)            deny "unknown option for tickets note: $1" ;;
+    esac
+  done
+
+  if [[ -z "$body" ]]; then
+    deny "tickets note requires --body"
+  fi
+
+  # Build CMD_STR without --confirmed for nonce matching
+  local match_cmd="freshdesk tickets note ${ticket_id} --body ${body} --private ${private}"
+
+  if [[ -n "$confirmed_nonce" ]]; then
+    # Layer 3: Human-in-the-loop confirmation
+    verify_nonce "$confirmed_nonce" "$match_cmd"
+    log_entry "$CMD_STR" "HUMAN-APPROVED"
+
+    local json_body
+    json_body=$(python3 -c "
+import json,sys
+print(json.dumps({'body': sys.argv[1], 'private': sys.argv[2].lower() == 'true'}))
+" "$body" "$private")
+
+    local rc=0
+    api_call POST "/tickets/${ticket_id}/notes" -d "$json_body" || rc=$?
+    log_entry "$CMD_STR" "HUMAN-APPROVED" "$rc"
+    exit "$rc"
+  fi
+
+  # Layer 2: Dry-run enforced
+  local nonce
+  nonce=$(generate_nonce)
+  save_nonce "$nonce" "$match_cmd"
+  log_entry "$CMD_STR" "DRY-RUN-ENFORCED"
+
+  echo "freshdesk-safe: DRY-RUN-ENFORCED — write operation requires confirmation" >&2
+  echo "" >&2
+  echo "Operation: Add note to ticket #${ticket_id}" >&2
+  echo "Private:   ${private}" >&2
+  echo "Body:      ${body}" >&2
+  echo "" >&2
+  echo "To execute, re-run with: freshdesk-safe tickets note ${ticket_id} --body \"...\" --private ${private} --confirmed ${nonce}" >&2
+  exit 2
+}
+
+cmd_contacts_list() {
+  local -a params=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --page)      params+=("page=$2"); shift 2 ;;
+      --per_page)  params+=("per_page=$2"); shift 2 ;;
+      *)           deny "unknown option for contacts list: $1" ;;
+    esac
+  done
+
+  local endpoint="/contacts"
+  if (( ${#params[@]} > 0 )); then
+    local query_string
+    query_string=$(IFS='&'; echo "${params[*]}")
+    endpoint="/contacts?${query_string}"
+  fi
+
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  api_call GET "$endpoint" || rc=$?
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
+cmd_contacts_view() {
+  if (( $# < 1 )); then
+    deny "contacts view requires a contact ID"
+  fi
+
+  local contact_id="$1"; shift
+  [[ -z "$contact_id" ]] && deny "contact ID must not be empty"
+  [[ "$contact_id" =~ ^[0-9]+$ ]] || deny "contact ID must be numeric"
+
+  if (( $# > 0 )); then
+    deny "unknown option for contacts view: $1"
+  fi
+
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  api_call GET "/contacts/${contact_id}" || rc=$?
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
+# --- Usage ---
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: freshdesk-safe <resource> <action> [options]
+
+Commands:
+  tickets list    [--page N] [--per_page N] [--filter "..."]
+  tickets view    ID [--include conversations]
+  tickets search  --query "status:2 AND priority:4"
+  tickets note    ID --body "note text" [--private true] [--confirmed NONCE]
+  contacts list   [--page N] [--per_page N]
+  contacts view   ID
+
+All other operations are blocked.
+USAGE
+  exit 1
+}
+
+# --- Main ---
+
+main() {
+  init_log
+
+  CMD_STR="freshdesk (no args)"
+
+  if (( $# == 0 )); then
+    usage
+  fi
+
+  CMD_STR="freshdesk $*"
+  CMD_STR="${CMD_STR//$'\n'/\\n}"
+  CMD_STR="${CMD_STR//$'\r'/\\r}"
+  CMD_STR="${CMD_STR//$'\t'/\\t}"
+
+  local resource="${1:-}"
+  local action="${2:-}"
+  shift 2 2>/dev/null || true
+
+  # Layer 1: Command allowlist
+  case "${resource}:${action}" in
+    tickets:list)    load_config; cmd_tickets_list "$@" ;;
+    tickets:view)    load_config; cmd_tickets_view "$@" ;;
+    tickets:search)  load_config; cmd_tickets_search "$@" ;;
+    tickets:note)    load_config; cmd_tickets_note "$@" ;;
+    contacts:list)   load_config; cmd_contacts_list "$@" ;;
+    contacts:view)   load_config; cmd_contacts_view "$@" ;;
+    *)
+      deny "command '${resource} ${action}' is not in the allowlist"
+      ;;
+  esac
+}
+
+main "$@"

@@ -143,6 +143,8 @@ Every deliverable must meet all of the following:
 - **Dwight:** Submits completed implementations for security review. Does not make security judgment calls.
 - **Pam:** Reports task status (started, blocked, completed). Consumes task assignments. Does not self-assign or reprioritize.
 - **Michael:** Receives plans and priorities. Reports back if plan is unclear or infeasible.
+- **Creed:** Receives bug reports on implementations. Does not apply fixes suggested by Creed without review.
+- **Toby:** Coordinates when agent definitions require corresponding skill or workflow implementations.
 
 ## Common Pitfalls to Avoid
 

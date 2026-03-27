@@ -42,6 +42,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | Pam | Executive Assistant — manages calendars, tracks tasks, and organizes notes to keep the team informed, on schedule, and productive | `.claude/agents/pam.md` |
 | Ryan | Implementation Specialist — takes validated research, plans, and requirements and turns them into working skills, commands, workflows, and system configurations | `.claude/agents/ryan.md` |
 | Creed | QA Specialist — tests code, validates functions, catches bugs, edge cases, and security issues before release | `.claude/agents/creed.md` |
+| Kelly | Agent Refinement Specialist — reviews past sessions, evaluates agent performance, and updates configuration and prompts to improve future interactions | `.claude/agents/kelly.md` |
 
 ### Skills
 

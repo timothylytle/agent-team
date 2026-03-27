@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GWS_BIN="/usr/bin/gws"
+LOG_DIR="$HOME/.local/log/gws-safe"
+LOG_FILE="$LOG_DIR/audit.log"
+NONCE_DIR="$LOG_DIR/nonces"
+
+# --- Logging ---
+
+init_log() {
+  mkdir -p "$LOG_DIR" || { echo "FATAL: cannot create log directory $LOG_DIR" >&2; exit 1; }
+  mkdir -p "$NONCE_DIR" || { echo "FATAL: cannot create nonce directory $NONCE_DIR" >&2; exit 1; }
+  # Verify we can write
+  if ! touch "$LOG_FILE" 2>/dev/null; then
+    echo "FATAL: cannot write to $LOG_FILE" >&2
+    exit 1
+  fi
+  # Clean up expired nonce files (older than 5 minutes)
+  find "$NONCE_DIR" -name '*.json' -mmin +5 -delete 2>/dev/null || true
+}
+
+log_entry() {
+  local cmd="$1" decision="$2" exit_code="${3:-null}"
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  # Escape cmd for JSON: backslashes then double-quotes
+  cmd="${cmd//\\/\\\\}"
+  cmd="${cmd//\"/\\\"}"
+  printf '{"ts":"%s","cmd":"%s","decision":"%s","exit_code":%s}\n' \
+    "$ts" "$cmd" "$decision" "$exit_code" >> "$LOG_FILE"
+}
+
+deny() {
+  local reason="$1"
+  log_entry "$CMD_STR" "BLOCKED: $reason"
+  echo "gws-safe: BLOCKED — $reason" >&2
+  exit 1
+}
+
+# --- Confirmed-Eligible Allowlist ---
+
+# Returns 0 if the command (positional tokens) is eligible for --confirmed
+is_confirmed_eligible() {
+  local -a tokens=("$@")
+  local svc="${tokens[0]:-}"
+  local token_str="${tokens[*]}"
+
+  local -a eligible_paths=(
+    "drive files create"
+    "drive files update"
+    "drive files copy"
+    "calendar events insert"
+    "calendar events update"
+    "calendar events quickAdd"
+    "gmail users messages send"
+    "gmail users drafts create"
+    "docs documents batchUpdate"
+    "docs documents create"
+  )
+  local -a eligible_helpers=(+send +reply +upload +append +write)
+
+  # Check helper commands
+  for eh in "${eligible_helpers[@]}"; do
+    if [[ "$svc" == "$eh" ]]; then
+      return 0
+    fi
+  done
+
+  # Check command paths — match if tokens start with an eligible path
+  for ep in "${eligible_paths[@]}"; do
+    if [[ "$token_str" == "$ep" || "$token_str" == "$ep "* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# --- Nonce Functions ---
+
+generate_nonce() {
+  head -c 4 /dev/urandom | xxd -p
+}
+
+save_nonce() {
+  local nonce="$1" cmd="$2"
+  local ts expires
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  expires=$(date -u -d "+5 minutes" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -v+5M +"%Y-%m-%dT%H:%M:%SZ")
+  # Escape for JSON
+  local cmd_escaped="${cmd//\\/\\\\}"
+  cmd_escaped="${cmd_escaped//\"/\\\"}"
+  printf '{"nonce":"%s","cmd":"%s","ts":"%s","expires":"%s"}\n' \
+    "$nonce" "$cmd_escaped" "$ts" "$expires" > "$NONCE_DIR/$nonce.json"
+}
+
+verify_nonce() {
+  local nonce="$1" current_cmd="$2"
+  local nonce_file="$NONCE_DIR/$nonce.json"
+
+  if [[ ! -f "$nonce_file" ]]; then
+    log_entry "$CMD_STR" "BLOCKED: invalid or expired nonce"
+    echo "gws-safe: BLOCKED — invalid or expired nonce" >&2
+    exit 1
+  fi
+
+  # Read stored values
+  local stored_cmd stored_expires
+  stored_cmd=$(python3 -c "import json,sys; print(json.load(sys.stdin)['cmd'])" < "$nonce_file")
+  stored_expires=$(python3 -c "import json,sys; print(json.load(sys.stdin)['expires'])" < "$nonce_file")
+
+  # Check expiry
+  local now_epoch expires_epoch
+  now_epoch=$(date -u +%s)
+  expires_epoch=$(date -u -d "$stored_expires" +%s 2>/dev/null \
+    || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$stored_expires" +%s)
+  if (( now_epoch > expires_epoch )); then
+    rm -f "$nonce_file"
+    log_entry "$CMD_STR" "BLOCKED: nonce expired"
+    echo "gws-safe: BLOCKED — invalid or expired nonce" >&2
+    exit 1
+  fi
+
+  # Check command match
+  if [[ "$current_cmd" != "$stored_cmd" ]]; then
+    log_entry "$CMD_STR" "BLOCKED: command does not match dry-run"
+    echo "gws-safe: BLOCKED — command does not match dry-run" >&2
+    exit 1
+  fi
+
+  # Valid — delete nonce file (one-time use)
+  rm -f "$nonce_file"
+}
+
+# --- Argument Parsing Helpers ---
+
+# Extract positional (non-flag) tokens from the argument list.
+# Skips flags (--foo, -f) and their values when the flag takes one (--flag value).
+# This is intentionally conservative: flags we don't recognise are assumed to NOT
+# consume the next token, which keeps us from accidentally skipping a subcommand.
+extract_positional_tokens() {
+  local -a tokens=()
+  local skip_next=0
+  local end_of_flags=0
+  for arg in "$@"; do
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    # Once -- is seen, all remaining arguments are positional
+    if (( end_of_flags )); then
+      tokens+=("$arg")
+      continue
+    fi
+    case "$arg" in
+      # End-of-flags marker
+      --)
+        end_of_flags=1
+        continue
+        ;;
+      # Flags that take a value as the next token
+      --confirmed|\
+      --params|--fields|--filter|--query|--orderBy|--pageSize|--pageToken|\
+      --userId|--format|--scopes|--calendarId|--eventId|--fileId|--driveId|\
+      --revisionId|--permissionId|--messageId|--draftId|--labelId|\
+      --contactId|--spreadsheetId|--documentId|--presentationId|\
+      --range|--values|--body|--requestBody|--resource|--title|--name|\
+      --description|--mimeType|--parents|--destination|--type|\
+      --role|--emailAddress|--domain|--sendUpdates|--conferenceDataVersion|\
+      --maxResults|--timeMin|--timeMax|--q|--s|--to|--subject|--from|\
+      --cc|--bcc|--htmlBody|--textBody|--attachment|--labelIds)
+        skip_next=1
+        continue
+        ;;
+      # Flags with = embedded value
+      --*=*)
+        continue
+        ;;
+      # Any other flag
+      --*|-?)
+        continue
+        ;;
+      *)
+        tokens+=("$arg")
+        ;;
+    esac
+  done
+  printf '%s\n' "${tokens[@]}"
+}
+
+# --- Checks ---
+
+check_service_restriction() {
+  local first_token="$1"
+  # Explicit allowlist for + helper commands
+  if [[ "$first_token" == +* ]]; then
+    local -a allowed_helpers=(+send +reply +triage +upload +agenda +append +read +write +standup-report +meeting-prep)
+    for helper in "${allowed_helpers[@]}"; do
+      if [[ "$first_token" == "$helper" ]]; then
+        return 0
+      fi
+    done
+    deny "helper command '$first_token' is not in the allowlist — add it to allowed_helpers in gws-safe"
+  fi
+  local allowed_services="drive gmail calendar docs documents sheets slides people tasks keep"
+  for svc in $allowed_services; do
+    if [[ "$first_token" == "$svc" ]]; then
+      return 0
+    fi
+  done
+  deny "service '$first_token' is not in the allowed list"
+}
+
+check_auth_block() {
+  local first_token="$1"
+  if [[ "$first_token" == "auth" ]]; then
+    deny "auth commands are not permitted"
+  fi
+  # Check for --scopes anywhere in original args
+  for arg in "$@"; do
+    if [[ "$arg" == "--scopes" || "$arg" == --scopes=* ]]; then
+      deny "--scopes flag is not permitted"
+    fi
+  done
+}
+
+check_blocked_subcommands() {
+  local -a tokens=("$@")
+  local num_tokens=${#tokens[@]}
+
+  # --- Exact command-path patterns ---
+  # Build the command path from positional tokens for pattern matching.
+  # tokens[0] = service, tokens[1] = resource, tokens[2] = action, etc.
+
+  local svc="${tokens[0]:-}"
+  local res="${tokens[1]:-}"
+  local act="${tokens[2]:-}"
+
+  # Block: gws calendar acl * (any acl subcommand)
+  if [[ "$svc" == "calendar" && "$res" == "acl" ]]; then
+    deny "calendar acl commands are not permitted"
+  fi
+
+  # Block: gws gmail users settings * (any settings modification)
+  if [[ "$svc" == "gmail" && "$res" == "users" && "$act" == "settings" ]]; then
+    deny "gmail settings commands are not permitted"
+  fi
+
+  # Specific blocked command paths (service resource action)
+  local -a blocked_paths=(
+    "drive files delete"
+    "drive files emptyTrash"
+    "drive drives delete"
+    "drive revisions delete"
+    "drive permissions delete"
+    "drive permissions update"
+    "gmail users messages delete"
+    "gmail users messages batchDelete"
+    "gmail users messages batchModify"
+    "gmail users messages trash"
+    "gmail users messages modify"
+    "gmail users drafts delete"
+    "calendar calendars clear"
+    "calendar calendars delete"
+    "calendar events delete"
+    "people people deleteContact"
+    "people people batchDeleteContacts"
+    "drive permissions create"
+  )
+
+  # Build the positional path string for matching
+  local path_str="${tokens[*]}"
+
+  for bp in "${blocked_paths[@]}"; do
+    # Check if the positional tokens start with the blocked path
+    if [[ "$path_str" == "$bp" || "$path_str" == "$bp "* ]]; then
+      deny "command pattern '$bp' is blocked"
+    fi
+  done
+
+  # --- Generic blocked subcommand tokens (positional only) ---
+  # These catch anything that slips past the path-based check.
+  local -a blocked_tokens=(delete emptyTrash batchDelete batchDeleteContacts deleteContact trash batchModify modify clear batchClear)
+
+  for token in "${tokens[@]}"; do
+    for bt in "${blocked_tokens[@]}"; do
+      if [[ "$token" == "$bt" ]]; then
+        deny "subcommand '$bt' is blocked"
+      fi
+    done
+  done
+
+  # 'remove' is only blocked in permissions context
+  if [[ "$svc" == "drive" && "$res" == "permissions" ]]; then
+    for token in "${tokens[@]}"; do
+      if [[ "$token" == "remove" ]]; then
+        deny "subcommand 'remove' is blocked in permissions context"
+      fi
+    done
+  fi
+}
+
+check_write_dryrun() {
+  local -a tokens=("$@")
+  shift "$((${#tokens[@]}))"
+  # remaining args are the original full args — passed after tokens
+  # Actually, let's redesign: caller passes tokens then a separator then original args.
+  # Simpler: just accept original_args as a global.
+
+  local -a write_ops=(create update insert send copy quickAdd patch append batchUpdate)
+  # + helper commands that are write operations
+  local -a write_helpers=(+send +reply +triage +upload +append +write)
+
+  local is_write=0
+
+  # Check if first token is a write helper
+  if (( ${#tokens[@]} > 0 )); then
+    for wh in "${write_helpers[@]}"; do
+      if [[ "${tokens[0]}" == "$wh" ]]; then
+        is_write=1
+        break
+      fi
+    done
+  fi
+
+  # Check positional tokens for write operation subcommands
+  if (( ! is_write )); then
+    for token in "${tokens[@]}"; do
+      for wo in "${write_ops[@]}"; do
+        if [[ "$token" == "$wo" ]]; then
+          is_write=1
+          break 2
+        fi
+      done
+    done
+  fi
+
+  if (( ! is_write )); then
+    return 0  # not a write op, nothing to enforce
+  fi
+
+  # Check if --dry-run is already in the original args
+  for arg in "${ORIGINAL_ARGS[@]}"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+      return 0  # already has dry-run
+    fi
+  done
+
+  # Inject --dry-run — agents cannot bypass this
+  local nonce
+  nonce=$(generate_nonce)
+  save_nonce "$nonce" "$CMD_STR"
+  log_entry "$CMD_STR" "DRY-RUN-ENFORCED"
+  echo "gws-safe: DRY-RUN-ENFORCED — to execute for real, re-run with --confirmed $nonce" >&2
+  local rc=0
+  "$GWS_BIN" "${ORIGINAL_ARGS[@]}" --dry-run || rc=$?
+  # Log the actual execution result
+  log_entry "$CMD_STR --dry-run (injected)" "DRY-RUN-ENFORCED" "$rc"
+  exit 2
+}
+
+# --- Main ---
+
+main() {
+  init_log
+
+  CMD_STR="gws (no args)"
+
+  if (( $# == 0 )); then
+    deny "no arguments provided"
+  fi
+
+  ORIGINAL_ARGS=("$@")
+
+  # Detect --confirmed <nonce> and extract it
+  local confirmed_nonce=""
+  local -a args_without_confirmed=()
+  local skip_next=0
+  for arg in "$@"; do
+    if (( skip_next )); then
+      confirmed_nonce="$arg"
+      skip_next=0
+      continue
+    fi
+    if [[ "$arg" == "--confirmed" ]]; then
+      skip_next=1
+      continue
+    fi
+    args_without_confirmed+=("$arg")
+  done
+
+  # If --confirmed was present but no nonce followed
+  if (( skip_next )); then
+    CMD_STR="gws $*"
+    CMD_STR="${CMD_STR//$'\n'/\\n}"
+    CMD_STR="${CMD_STR//$'\r'/\\r}"
+    CMD_STR="${CMD_STR//$'\t'/\\t}"
+    log_entry "$CMD_STR" "BLOCKED: --confirmed requires a nonce argument"
+    echo "gws-safe: BLOCKED — --confirmed requires a nonce argument" >&2
+    exit 1
+  fi
+
+  # Build CMD_STR from the args without --confirmed (for matching against stored nonce)
+  if [[ -n "$confirmed_nonce" ]]; then
+    CMD_STR="gws ${args_without_confirmed[*]}"
+  else
+    CMD_STR="gws $*"
+  fi
+
+  # Sanitize CMD_STR to prevent log injection via embedded newlines/carriage returns
+  CMD_STR="${CMD_STR//$'\n'/\\n}"
+  CMD_STR="${CMD_STR//$'\r'/\\r}"
+  CMD_STR="${CMD_STR//$'\t'/\\t}"
+
+  # Extract positional tokens (subcommands, not flag values) — always from args without --confirmed
+  local -a pos_tokens
+  mapfile -t pos_tokens < <(extract_positional_tokens "${args_without_confirmed[@]}")
+
+  if (( ${#pos_tokens[@]} == 0 )); then
+    deny "no subcommand detected"
+  fi
+
+  local first="${pos_tokens[0]}"
+
+  # Check 3 — Auth block (check original args for --scopes)
+  check_auth_block "$first" "$@"
+
+  # Check 5 — Service restriction
+  check_service_restriction "$first"
+
+  # Check 1/2 — Blocked subcommands (operates on positional tokens only)
+  # For + commands, still check blocked patterns on the tokens after the + command
+  check_blocked_subcommands "${pos_tokens[@]}"
+
+  # Handle --confirmed flow
+  if [[ -n "$confirmed_nonce" ]]; then
+    # Verify the command is eligible for --confirmed
+    if ! is_confirmed_eligible "${pos_tokens[@]}"; then
+      log_entry "$CMD_STR" "POLICY-VIOLATION: command not eligible for --confirmed"
+      echo "gws-safe: POLICY-VIOLATION: command not eligible for --confirmed" >&2
+      exit 1
+    fi
+
+    # Verify the nonce
+    verify_nonce "$confirmed_nonce" "$CMD_STR"
+
+    # Nonce valid — execute the real command
+    log_entry "$CMD_STR" "HUMAN-APPROVED"
+    ORIGINAL_ARGS=("${args_without_confirmed[@]}")
+    local rc=0
+    "$GWS_BIN" "${args_without_confirmed[@]}" || rc=$?
+    log_entry "$CMD_STR" "HUMAN-APPROVED" "$rc"
+    exit "$rc"
+  fi
+
+  # Check 4 — Write operation dry-run enforcement
+  check_write_dryrun "${pos_tokens[@]}"
+
+  # All checks passed — execute
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  "$GWS_BIN" "$@" || rc=$?
+
+  # Update log with exit code (append a second entry with the result)
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
+main "$@"

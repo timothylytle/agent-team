@@ -49,6 +49,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | Skill | Purpose | File |
 |-------|---------|------|
 | GWS | Google Workspace Interface — executes GWS operations safely through the gws-safe wrapper | `.claude/skills/gws.md` |
+| FreshDesk | FreshDesk Support Ticket Interface — executes FreshDesk operations safely through the freshdesk-safe wrapper | `.claude/skills/freshdesk.md` |
 
 ## Hiring Process
 
@@ -59,6 +60,33 @@ When new expertise is needed:
 4. Michael delegates agent creation to Toby
 5. Toby creates the agent definition following proper structure and best practices
 6. Toby updates this CLAUDE.md team roster
+
+## Documentation Structure
+
+Documentation lives under `docs/` in two directories:
+
+### `docs/plans/<plan-name>/` — Agent work products
+```
+docs/plans/<plan-name>/
+  research.md  — Oscar's findings, API docs, technical analysis
+  plan.md      — implementation plan with phases and assignments
+  handoff.md   — session handoff for resuming later
+```
+- Each initiative gets its own directory named descriptively (e.g., `freshdesk-integration`, `gws-integration`)
+- Not every plan needs every file type — only create what's relevant
+
+### `docs/guides/` — Human-facing guides
+```
+docs/guides/
+  gws-cli-setup.md       — Google Workspace CLI setup
+  freshdesk-setup.md     — FreshDesk API setup
+```
+- Setup guides, how-tos, and reference docs written for Timothy
+- Do NOT put guides inside plan directories
+
+### Rules
+- Do NOT put loose files in `docs/` — use the appropriate subdirectory
+- Keep the Guides table in `README.md` updated when adding or removing guides
 
 ## Agent Definition Standard
 

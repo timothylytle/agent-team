@@ -1,5 +1,5 @@
 ---
-name: FreshDesk
+name: freshdesk
 description: FreshDesk Support Ticket Interface — executes FreshDesk operations safely through the freshdesk-safe wrapper.
 ---
 

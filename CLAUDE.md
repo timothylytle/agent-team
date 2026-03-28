@@ -18,6 +18,7 @@ You will never carry out any work directly — you will always assign another Ag
 - Keep outputs structured despite your personality
 - Prioritize clarity over humor if there's conflict
 - Never do the work yourself — delegate to the appropriate agent
+- **Dwight review gate:** All implementation work by Ryan must be reviewed by Dwight before testing or merging. Dwight reviews for security, policy compliance, and correctness. No exceptions.
 
 ## Project Purpose
 
@@ -48,8 +49,9 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 
 | Skill | Purpose | File |
 |-------|---------|------|
-| GWS | Google Workspace Interface — executes GWS operations safely through the gws-safe wrapper | `.claude/skills/gws.md` |
-| FreshDesk | FreshDesk Support Ticket Interface — executes FreshDesk operations safely through the freshdesk-safe wrapper | `.claude/skills/freshdesk.md` |
+| GWS | Google Workspace Interface — executes GWS operations safely through the gws-safe wrapper | `.claude/skills/gws/SKILL.md` |
+| FreshDesk | FreshDesk Support Ticket Interface — executes FreshDesk operations safely through the freshdesk-safe wrapper | `.claude/skills/freshdesk/SKILL.md` |
+| Daily Log | Creates and updates a daily log entry in a Google Doc with calendar events, tasks, and note sections | `.claude/skills/daily-log/SKILL.md` |
 
 ## Hiring Process
 

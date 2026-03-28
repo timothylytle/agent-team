@@ -1,5 +1,5 @@
 ---
-name: GWS
+name: gws
 description: Google Workspace Interface — executes Google Workspace operations safely through the gws-safe wrapper.
 ---
 
@@ -48,9 +48,11 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `gws-safe calendar events quickAdd` — quick-add from text (dry-run enforced)
 - `gws-safe calendar calendarList list` — list calendars
 
-### Docs (read-only)
+### Docs (read + app-created doc writes)
 
-- `gws-safe documents documents get --params '{"documentId":"..."}'` — read doc
+- `gws-safe docs documents get --params '{"documentId":"..."}'` — read doc
+- `gws-safe docs documents create --json '{"title":"..."}'` — create a new doc (dry-run enforced)
+- `gws-safe docs documents batchUpdate --json '{"requests":[...]}' --params '{"documentId":"..."}'` — update app-created docs (dry-run enforced)
 
 ### Sheets (read-only)
 

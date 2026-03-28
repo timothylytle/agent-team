@@ -58,7 +58,7 @@ is_confirmed_eligible() {
     "docs documents batchUpdate"
     "docs documents create"
   )
-  local -a eligible_helpers=(+send +reply +upload +append +write)
+  local -a eligible_helpers=(+send +reply +triage +upload +append +write)
 
   # Check helper commands
   for eh in "${eligible_helpers[@]}"; do
@@ -161,7 +161,7 @@ extract_positional_tokens() {
         continue
         ;;
       # Flags that take a value as the next token
-      --confirmed|\
+      --confirmed|--json|\
       --params|--fields|--filter|--query|--orderBy|--pageSize|--pageToken|\
       --userId|--format|--scopes|--calendarId|--eventId|--fileId|--driveId|\
       --revisionId|--permissionId|--messageId|--draftId|--labelId|\

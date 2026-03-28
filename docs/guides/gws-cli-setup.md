@@ -94,7 +94,7 @@ This grants read-only access to Drive, Gmail, Calendar, Docs, Sheets, Slides, an
 ### Option B: Read-Only + Narrow Write Scopes (for agent workflows that need to send email, create events, or create files)
 
 ```bash
-gws auth login --scopes "https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/calendar.readonly,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/documents.readonly,https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/presentations.readonly,https://www.googleapis.com/auth/contacts.readonly"
+gws auth login --scopes "https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/calendar.readonly,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/documents.readonly,https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/presentations.readonly,https://www.googleapis.com/auth/contacts.readonly,https://www.googleapis.com/auth/tasks.readonly"
 ```
 
 ### After authenticating (either option):
@@ -121,6 +121,7 @@ gws auth login --scopes "https://www.googleapis.com/auth/drive.readonly,https://
 | `spreadsheets.readonly` | Read Google Sheets content. No write. |
 | `presentations.readonly` | Read Google Slides content. No write. |
 | `contacts.readonly` | Read contacts. No write or delete. |
+| `tasks.readonly` | Read task lists and tasks. No write or delete. |
 
 ---
 
@@ -140,7 +141,7 @@ This server-side enforcement means even if someone tampers with the local CLI co
 
 5. Set the app to **Limited**.
 
-6. Allow **only** these 10 scopes (use the full URL format):
+6. Allow **only** these 11 scopes (use the full URL format):
    ```
    https://www.googleapis.com/auth/drive.readonly
    https://www.googleapis.com/auth/drive.file
@@ -152,6 +153,7 @@ This server-side enforcement means even if someone tampers with the local CLI co
    https://www.googleapis.com/auth/spreadsheets.readonly
    https://www.googleapis.com/auth/presentations.readonly
    https://www.googleapis.com/auth/contacts.readonly
+   https://www.googleapis.com/auth/tasks.readonly
    ```
 
 7. Save the configuration.
@@ -219,6 +221,7 @@ If all reads succeed and unauthorized writes fail, you're set.
 | `spreadsheets.readonly` | Read-only | Yes | No | No |
 | `presentations.readonly` | Read-only | Yes | No | No |
 | `contacts.readonly` | Read-only | Yes | No | No |
+| `tasks.readonly` | Read-only | Yes | No | No |
 
 ---
 

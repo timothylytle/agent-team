@@ -183,23 +183,91 @@ Check the document for entries (HEADING_1 paragraphs with date text) that are fr
 
 **If old entries exist:**
 
-1. Check the config file for an `archiveDocumentId`. If it does not exist, create a new Google Doc named `_daily_log_archive_YYYY` (where YYYY is the current year):
+### 5a: Ensure archive doc exists
+
+Check the config file for an `archiveDocumentId`.
+
+**If no `archiveDocumentId`:**
+1. Create a new Google Doc:
    ```bash
-   gws-safe docs documents create --json '{"title":"_daily_log_archive_YYYY"}'
+   gws-safe docs documents create --json '{"title":"_daily_log_archive"}'
    ```
-   This is a write operation. Present the dry-run to the user, get confirmation, then execute with `--confirmed <nonce>`. Save the new document's `documentId` as `archiveDocumentId` in the config file.
+   This is a write operation. Present dry-run, get confirmation, execute with `--confirmed <nonce>`. Save the document ID as `archiveDocumentId` in the config file.
 
-   Updated config file schema:
-   ```json
-   {
-     "documentId": "<MAIN_DOC_ID>",
-     "archiveDocumentId": "<ARCHIVE_DOC_ID>"
-   }
+**If `archiveDocumentId` exists:** Read the archive doc with tabs:
+```bash
+gws-safe docs documents get --params '{"documentId":"<ARCHIVE_DOC_ID>","includeTabsContent":true}'
+```
+If the read fails (404 or 403), inform the user and offer to create a new archive doc.
+
+### 5b: Determine target tabs for each entry
+
+For each old entry, parse the date from its HEADING_1 text and determine:
+
+- **Year**: e.g., `2026`
+- **Quarter**: `Q1` (Jan–Mar), `Q2` (Apr–Jun), `Q3` (Jul–Sep), `Q4` (Oct–Dec)
+- **Week Monday**: the Monday of the week containing the entry's date
+- **Week Friday**: Week Monday + 4 days
+- **Week number within the quarter**: Find the first Monday on or after the quarter's start date (Jan 1, Apr 1, Jul 1, or Oct 1). Week 1 starts on that Monday. Count forward in 7-day increments to determine the entry's week number.
+- **Tab titles**:
+  - Year tab: `YYYY` (e.g., `2026`)
+  - Quarter tab: `YYYY-QN` (e.g., `2026-Q1`)
+  - Week tab: `Week N (Mon D-D)` if Monday and Friday are the same month (e.g., `Week 3 (Jan 19-23)`), or `Week N (Mon D - Mon D)` if they span months (e.g., `Week 10 (Sep 29 - Oct 3)`)
+
+### 5c: Create missing tabs
+
+Using the archive doc response from step 5a, build a map of existing tabs by walking the `tabs` array and all `childTabs` recursively. Map each tab by its `tabProperties.title` to its `tabProperties.tabId`.
+
+Identify which Year, Quarter, and Week tabs are needed but don't exist yet. Create them in dependency order, batching each level into a single batchUpdate:
+
+1. **Create missing Year tabs** (if any):
+   ```bash
+   gws-safe docs documents batchUpdate --json '{"requests":[{"addDocumentTab":{"tabProperties":{"title":"<YEAR>","index":<N>}}}]}' --params '{"documentId":"<ARCHIVE_DOC_ID>"}'
    ```
+   Extract new tab IDs from the `replies` array (`replies[N].addDocumentTab.tabProperties.tabId`).
 
-2. For each old entry (oldest first), copy its full text and formatting to the TOP of the archive doc via batchUpdate (insert at index 1), maintaining newest-to-oldest order in the archive.
+2. **Create missing Quarter tabs** (if any), using Year tab IDs as `parentTabId`:
+   ```bash
+   gws-safe docs documents batchUpdate --json '{"requests":[{"addDocumentTab":{"tabProperties":{"title":"<YYYY-QN>","parentTabId":"<YEAR_TAB_ID>","index":<N>}}}]}' --params '{"documentId":"<ARCHIVE_DOC_ID>"}'
+   ```
+   Set `index` so quarters appear in order (Q1=0, Q2=1, Q3=2, Q4=3) relative to existing sibling tabs.
 
-3. After successfully inserting into the archive, delete the old entries from the main doc using `deleteContentRange` in a batchUpdate. Process deletions from bottom to top (highest indices first) to avoid index shifting issues.
+3. **Create missing Week tabs** (if any), using Quarter tab IDs as `parentTabId`:
+   ```bash
+   gws-safe docs documents batchUpdate --json '{"requests":[{"addDocumentTab":{"tabProperties":{"title":"<WEEK_TITLE>","parentTabId":"<QUARTER_TAB_ID>","index":<N>}}}]}' --params '{"documentId":"<ARCHIVE_DOC_ID>"}'
+   ```
+   Set `index` so weeks appear in chronological order among existing sibling week tabs.
+
+Skip any batchUpdate that would have zero requests (all tabs at that level already exist).
+
+### 5d: Insert entries into archive tabs
+
+For each old entry, extract its full text and paragraph metadata (heading styles, bullet status) from the main doc. Group entries by target week tab.
+
+For each week tab, build requests to insert at the top of the tab (index 1):
+
+1. **`insertText`** at `{"tabId": "<WEEK_TAB_ID>", "index": 1}` — insert entries newest-first within each week so they appear newest-to-oldest
+2. **`updateParagraphStyle`** for heading paragraphs (HEADING_1 for date lines, HEADING_2 for section labels, HEADING_3 for note sub-sections)
+3. **`updateTextStyle`** with `weightedFontFamily: {"fontFamily": "Lexend"}` on all heading paragraphs, and `{"fontFamily": "Roboto"}` on all NORMAL_TEXT paragraphs
+4. **`createParagraphBullets`** for bulleted paragraphs
+
+If the week tab already has content (e.g., entries archived earlier), inserting at index 1 pushes existing content down, keeping newest entries at the top.
+
+Execute as a single batchUpdate across all week tabs. If the JSON exceeds ~500KB, split into multiple batchUpdates (one per week tab):
+```bash
+gws-safe docs documents batchUpdate --json '{"requests":[...]}' --params '{"documentId":"<ARCHIVE_DOC_ID>"}'
+```
+
+### 5e: Delete archived entries from main doc
+
+**Only proceed with deletion if Step 5d completed successfully for all entries.** If any archive insertion failed, stop and report the error — do not delete entries that were not successfully archived.
+
+Delete the old entries from the main doc. Each entry spans from its HEADING_1 `startIndex` to the next HEADING_1 `startIndex` (or the doc body's last `endIndex` for the final entry).
+
+Use `deleteContentRange` requests, processing deletions from bottom to top (highest indices first) to avoid index shifting:
+```bash
+gws-safe docs documents batchUpdate --json '{"requests":[{"deleteContentRange":{"range":{"startIndex":<START>,"endIndex":<END>}}}]}' --params '{"documentId":"<DOC_ID>"}'
+```
 
 **If no old entries exist:** Skip this step silently.
 

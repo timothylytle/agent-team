@@ -242,7 +242,7 @@ Skip any batchUpdate that would have zero requests (all tabs at that level alrea
 
 ### 5d: Insert entries into archive tabs
 
-For each old entry, extract its full text and paragraph metadata (heading styles, bullet status) from the main doc. Group entries by target week tab.
+For each old entry, extract its full text and paragraph metadata (heading styles, bullet status) from the main doc. Also extract inline images: when iterating paragraph elements, check for `inlineObjectElement` entries (not just `textRun`). For each `inlineObjectElement`, look up its `inlineObjectId` in the source tab's `inlineObjects` dictionary and extract the `contentUri` from `imageProperties` and the `size` (height/width) from the embedded object. Each `inlineObjectElement` occupies exactly 1 character position in the document. Group entries by target week tab.
 
 For each week tab, build requests to insert at the top of the tab (index 1):
 
@@ -250,6 +250,11 @@ For each week tab, build requests to insert at the top of the tab (index 1):
 2. **`updateParagraphStyle`** for heading paragraphs (HEADING_1 for date lines, HEADING_2 for section labels, HEADING_3 for note sub-sections)
 3. **`updateTextStyle`** with `weightedFontFamily: {"fontFamily": "Lexend"}` on all heading paragraphs, and `{"fontFamily": "Roboto"}` on all NORMAL_TEXT paragraphs
 4. **`createParagraphBullets`** for bulleted paragraphs
+5. **`insertInlineImage`** for each image extracted from the source entry. All `insertInlineImage` requests must be placed AFTER items 1–4 (insertText, updateParagraphStyle, updateTextStyle, createParagraphBullets) in the batchUpdate request array. Within the group of `insertInlineImage` requests, order from highest index to lowest to avoid index shifting. For each image, build a request with:
+   - `uri`: the `contentUri` from the source document's `inlineObjects`
+   - `objectSize`: the original `height` and `width` from the source embedded object
+   - `location`: `{"index": <N>, "tabId": "<WEEK_TAB_ID>"}` — the character position where the image appeared relative to the inserted text
+   The `contentUri` is a temporary authenticated URL — it works as long as the source doc was read and images are inserted in the same session. If a batchUpdate fails due to an image insertion error, retry the request without the failing `insertInlineImage` requests so that text and formatting are still archived. Report the missing images to the user.
 
 If the week tab already has content (e.g., entries archived earlier), inserting at index 1 pushes existing content down, keeping newest entries at the top.
 

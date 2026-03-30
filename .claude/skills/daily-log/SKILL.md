@@ -13,6 +13,11 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 - **Waiting task list ID:** `ZGRjdFdTV19KWGkxVTdMbg`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
 
+## Command Rules
+
+- Always pass JSON directly inline to `--json` and `--params` flags. Never use command substitution like `"$(cat /tmp/file.json)"` — pass the JSON string directly.
+- For large JSON payloads (e.g., batchUpdate requests), construct the full JSON and pass it as a single inline argument.
+
 ## Step 1: Ensure the daily log doc exists
 
 Read the config file at `/home/timothylytle/agent-team/config/daily_log.json`.

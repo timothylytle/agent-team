@@ -248,19 +248,56 @@ Skip any batchUpdate that would have zero requests (all tabs at that level alrea
 
 ### 5d: Insert entries into archive tabs
 
-For each old entry, extract its full text and paragraph metadata (heading styles, bullet status) from the main doc. Also extract inline images: when iterating paragraph elements, check for `inlineObjectElement` entries (not just `textRun`). For each `inlineObjectElement`, look up its `inlineObjectId` in the source tab's `inlineObjects` dictionary and extract the `contentUri` from `imageProperties` and the `size` (height/width) from the embedded object. Each `inlineObjectElement` occupies exactly 1 character position in the document. Group entries by target week tab.
+For each old entry, extract its full text and paragraph metadata (heading styles, bullet status) from the main doc. When iterating paragraph elements, handle these element types:
 
-For each week tab, build requests to insert at the top of the tab (index 1):
+- **`textRun`**: Standard text content. Extract the text and any text styling.
+- **`inlineObjectElement`**: Inline images. For each `inlineObjectElement`, look up its `inlineObjectId` in the source tab's `inlineObjects` dictionary and extract the `contentUri` from `imageProperties` and the `size` (height/width) from the embedded object. Each `inlineObjectElement` occupies exactly 1 character position in the document.
+- **`richLink`**: File chips (smart chips linking to other Google Docs/Sheets/etc.). For each `richLink`:
+  - Extract `richLinkProperties.title` (the display text) and `richLinkProperties.uri` (the link URL)
+  - If `title` is empty or missing, use the `uri` as the display text
+  - A `richLink` occupies 1 character in the source document but will be replaced with the full title text in the archive (since there is no `insertRichLink` batchUpdate request in the API)
+  - Track the character length difference (title length minus 1) as a cumulative offset for subsequent index calculations within the same entry
+  - When building the `insertText` request, substitute the title text in place of the 1-character richLink position
+- **`person`**: Person chips. For each `person` element:
+  - Extract `personProperties.email`
+  - A `person` element occupies 1 character in both source and destination
+  - Do NOT include the person character in the `insertText` string — it will be inserted separately via an `insertPerson` request
+
+**Index calculation note:** `richLink` elements change the text length: 1 source character becomes N characters (the title length). Track the cumulative offset when calculating archive indices. `person` elements preserve text length: 1 source character becomes 1 archive character (the person chip). `inlineObjectElement` preserves text length: 1 source character becomes 1 archive character (the image).
+
+Group entries by target week tab. For each week tab, build requests to insert at the top of the tab (index 1):
 
 1. **`insertText`** at `{"tabId": "<WEEK_TAB_ID>", "index": 1}` — insert entries newest-first within each week so they appear newest-to-oldest
 2. **`updateParagraphStyle`** for heading paragraphs (HEADING_1 for date lines, HEADING_2 for section labels, HEADING_3 for note sub-sections)
 3. **`updateTextStyle`** with `weightedFontFamily: {"fontFamily": "Lexend"}` on all heading paragraphs, and `{"fontFamily": "Roboto"}` on all NORMAL_TEXT paragraphs
 4. **`createParagraphBullets`** for bulleted paragraphs
-5. **`insertInlineImage`** for each image extracted from the source entry. All `insertInlineImage` requests must be placed AFTER items 1–4 (insertText, updateParagraphStyle, updateTextStyle, createParagraphBullets) in the batchUpdate request array. Within the group of `insertInlineImage` requests, order from highest index to lowest to avoid index shifting. For each image, build a request with:
-   - `uri`: the `contentUri` from the source document's `inlineObjects`
-   - `objectSize`: the original `height` and `width` from the source embedded object
-   - `location`: `{"index": <N>, "tabId": "<WEEK_TAB_ID>"}` — the character position where the image appeared relative to the inserted text
-   The `contentUri` is a temporary authenticated URL — it works as long as the source doc was read and images are inserted in the same session. If a batchUpdate fails due to an image insertion error, retry the request without the failing `insertInlineImage` requests so that text and formatting are still archived. Report the missing images to the user.
+5. **`updateTextStyle`** with a hyperlink for each `richLink` element. After text insertion, add an `updateTextStyle` request to apply the link:
+   ```json
+   {
+     "updateTextStyle": {
+       "range": {"startIndex": <START>, "endIndex": <END>, "tabId": "<TAB_ID>"},
+       "textStyle": {"link": {"url": "<URI>"}},
+       "fields": "link"
+     }
+   }
+   ```
+   The `<START>` and `<END>` indices correspond to the title text that was substituted for the richLink in the insertText string. Place these requests AFTER items 1–4 but BEFORE `insertInlineImage` requests.
+6. **`insertInlineImage` and `insertPerson`** — Combine all image and person insertion requests into a **single list**, then sort by index **highest to lowest** regardless of type. This prevents index misalignment when both types coexist in the same entry (an insertion at a lower index shifts all higher indices). Place these requests AFTER items 1–5 in the batchUpdate request array.
+   - For each **image**, build an `insertInlineImage` request with:
+     - `uri`: the `contentUri` from the source document's `inlineObjects`
+     - `objectSize`: the original `height` and `width` from the source embedded object
+     - `location`: `{"index": <N>, "tabId": "<WEEK_TAB_ID>"}`
+   - For each **person**, build an `insertPerson` request with:
+     ```json
+     {
+       "insertPerson": {
+         "personProperties": {"email": "<EMAIL>"},
+         "location": {"index": <N>, "tabId": "<TAB_ID>"}
+       }
+     }
+     ```
+   - The `contentUri` for images is a temporary authenticated URL — it works as long as the source doc was read and images are inserted in the same session. If a batchUpdate fails due to an image insertion error, retry the request without the failing `insertInlineImage` requests so that text and formatting are still archived. Report the missing images to the user.
+   - Note: `person` elements are excluded from the `insertText` string, creating a temporary -1 offset at each person position. Processing insertions highest-to-lowest ensures each insertion only shifts content below it, so earlier (higher-index) insertions don't affect later (lower-index) ones.
 
 If the week tab already has content (e.g., entries archived earlier), inserting at index 1 pushes existing content down, keeping newest entries at the top.
 

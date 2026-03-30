@@ -70,12 +70,12 @@ Extract from each event: `summary` (title) and `start.dateTime` or `start.date` 
 
 **In-progress tasks:**
 ```bash
-gws-safe tasks tasks list --params '{"tasklist":"TG16TWFNTkNRblVkdHdhbQ"}'
+gws-safe tasks tasks list --params '{"tasklist":"TG16TWFNTkNRblVkdHdhbQ","showAssigned":true}'
 ```
 
 **Waiting tasks:**
 ```bash
-gws-safe tasks tasks list --params '{"tasklist":"ZGRjdFdTV19KWGkxVTdMbg"}'
+gws-safe tasks tasks list --params '{"tasklist":"ZGRjdFdTV19KWGkxVTdMbg","showAssigned":true}'
 ```
 After fetching waiting tasks, filter the results to only include tasks where `due` matches today's date (format: `YYYY-MM-DDT00:00:00.000Z`). Tasks with future or past due dates should be excluded from the Waiting / Blockers section.
 

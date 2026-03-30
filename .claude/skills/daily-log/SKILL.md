@@ -12,6 +12,7 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 - **In-progress task list ID:** `TG16TWFNTkNRblVkdHdhbQ`
 - **Waiting task list ID:** `ZGRjdFdTV19KWGkxVTdMbg`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
+- **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip)
 
 ## Command Rules
 
@@ -73,6 +74,12 @@ gws-safe calendar events list --params '{"calendarId":"primary","timeMin":"<TODA
 Replace `<TODAY>` with today's date in `YYYY-MM-DD` format and `<TZ_OFFSET>` with the result of `date +%:z`.
 
 Extract from each event: `summary` (title) and `start.dateTime` or `start.date` (time).
+
+After fetching events, filter out:
+- Events with `eventType` of `workingLocation`
+- Events whose `colorId` matches any value in the `excludeEventColorIds` array from the config file
+
+If `excludeEventColorIds` is not set in the config, do not filter by color.
 
 **In-progress tasks:**
 ```bash

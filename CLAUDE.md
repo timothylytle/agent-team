@@ -52,6 +52,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 |-------|---------|------|
 | GWS | Google Workspace Interface — executes GWS operations safely through the gws-safe wrapper | `.claude/skills/gws/SKILL.md` |
 | FreshDesk | FreshDesk Support Ticket Interface — executes FreshDesk operations safely through the freshdesk-safe wrapper | `.claude/skills/freshdesk/SKILL.md` |
+| CRM | CRM Database Interface — executes CRM operations safely through the crm-safe wrapper | `.claude/skills/crm/SKILL.md` |
 | Daily Log | Creates and updates a daily log entry in a Google Doc with calendar events, tasks, and note sections | `.claude/skills/daily-log/SKILL.md` |
 
 ## Hiring Process

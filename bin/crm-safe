@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""CRM-safe wrapper for the local SQLite CRM database.
+
+Provides a CLI interface with dry-run/confirmation enforcement for write
+operations and parameterized queries for all database access.
+
+Usage: crm-safe <resource> <action> [options]
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+
+# --- Paths ---
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, '..', 'db', 'crm.db')
+LOG_DIR = os.path.join(SCRIPT_DIR, '..', 'logs')
+LOG_FILE = os.path.join(LOG_DIR, 'crm-safe.log')
+NONCE_DIR = '/tmp/crm-safe-nonces'
+
+# --- Logging ---
+
+def init():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(NONCE_DIR, exist_ok=True)
+    # Clean expired nonces (older than 5 minutes)
+    now = time.time()
+    try:
+        for f in os.listdir(NONCE_DIR):
+            fp = os.path.join(NONCE_DIR, f)
+            if f.endswith('.json') and os.path.isfile(fp):
+                if now - os.path.getmtime(fp) > 300:
+                    os.remove(fp)
+    except OSError:
+        pass
+
+
+def log_entry(cmd, decision, exit_code=None):
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    entry = {
+        'timestamp': ts,
+        'command': cmd,
+        'decision': decision,
+        'exit_code': exit_code,
+    }
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except OSError:
+        pass
+
+
+# --- Nonce Functions ---
+
+def generate_nonce():
+    return os.urandom(4).hex()
+
+
+def save_nonce(nonce, cmd):
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    data = {'nonce': nonce, 'cmd': cmd, 'ts': ts}
+    path = os.path.join(NONCE_DIR, f'{nonce}.json')
+    with open(path, 'w') as f:
+        json.dump(data, f)
+
+
+def verify_nonce(nonce, current_cmd):
+    path = os.path.join(NONCE_DIR, f'{nonce}.json')
+    if not os.path.isfile(path):
+        return False, 'invalid or expired nonce'
+    # Check age (5 minute expiry)
+    if time.time() - os.path.getmtime(path) > 300:
+        os.remove(path)
+        return False, 'nonce expired'
+    with open(path) as f:
+        data = json.load(f)
+    if data['cmd'] != current_cmd:
+        return False, 'command does not match dry-run'
+    # Valid - delete (one-time use)
+    os.remove(path)
+    return True, None
+
+
+# --- Database ---
+
+def get_db():
+    if not os.path.isfile(DB_PATH):
+        print(json.dumps({'error': f'database not found: {DB_PATH}'}))
+        sys.exit(1)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
+    return conn
+
+
+def rows_to_list(rows):
+    return [dict(row) for row in rows]
+
+
+# --- Output ---
+
+def output_json(data):
+    print(json.dumps(data, indent=2))
+
+
+def deny(reason, cmd_str):
+    log_entry(cmd_str, 'BLOCKED')
+    output_json({'error': f'BLOCKED: {reason}'})
+    sys.exit(1)
+
+
+# --- Command: companies ---
+
+def cmd_companies_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    rows = db.execute('SELECT * FROM companies ORDER BY name').fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_companies_view(args, cmd_str):
+    if args.id is None:
+        deny('companies view requires an ID', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    company = db.execute('SELECT * FROM companies WHERE id = ?', (args.id,)).fetchone()
+    if not company:
+        output_json({'error': f'company {args.id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    result = dict(company)
+    result['contacts'] = rows_to_list(
+        db.execute('SELECT * FROM contacts WHERE company_id = ?', (args.id,)).fetchall()
+    )
+    result['tickets'] = rows_to_list(
+        db.execute('SELECT * FROM tickets WHERE company_id = ?', (args.id,)).fetchall()
+    )
+    result['files'] = rows_to_list(
+        db.execute(
+            'SELECT df.* FROM drive_files df '
+            'JOIN company_files cf ON cf.file_id = df.id '
+            'WHERE cf.company_id = ?',
+            (args.id,),
+        ).fetchall()
+    )
+    output_json(result)
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_companies_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if 'name' not in data or not data['name']:
+        deny('companies create requires "name" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create company', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('name', 'description', 'domains', 'health_score', 'account_tier',
+               'industry', 'renewal_date', 'custom_fields', 'freshdesk_id')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO companies ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM companies WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+def cmd_companies_update(args, cmd_str):
+    if args.id is None:
+        deny('companies update requires an ID', cmd_str)
+    data = _parse_json_arg(args, cmd_str)
+    if not data:
+        deny('companies update requires at least one field in JSON', cmd_str)
+    _write_gate(args, cmd_str, f'Update company {args.id}', data)
+    db = get_db()
+    existing = db.execute('SELECT id FROM companies WHERE id = ?', (args.id,)).fetchone()
+    if not existing:
+        output_json({'error': f'company {args.id} not found'})
+        sys.exit(1)
+    allowed = ('name', 'description', 'domains', 'health_score', 'account_tier',
+               'industry', 'renewal_date', 'custom_fields', 'freshdesk_id')
+    sets = []
+    vals = []
+    for k in allowed:
+        if k in data:
+            sets.append(f'{k} = ?')
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    if not sets:
+        deny('no valid fields to update', cmd_str)
+    sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+    vals.append(args.id)
+    try:
+        db.execute(f'UPDATE companies SET {", ".join(sets)} WHERE id = ?', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM companies WHERE id = ?', (args.id,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+# --- Command: contacts ---
+
+def cmd_contacts_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    if args.company_id is not None:
+        rows = db.execute(
+            'SELECT co.*, c.name AS company_name '
+            'FROM contacts co LEFT JOIN companies c ON co.company_id = c.id '
+            'WHERE co.company_id = ? ORDER BY co.name',
+            (args.company_id,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            'SELECT co.*, c.name AS company_name '
+            'FROM contacts co LEFT JOIN companies c ON co.company_id = c.id '
+            'ORDER BY co.name'
+        ).fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_contacts_view(args, cmd_str):
+    if args.id is None:
+        deny('contacts view requires an ID', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute('SELECT * FROM contacts WHERE id = ?', (args.id,)).fetchone()
+    if not row:
+        output_json({'error': f'contact {args.id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    result = dict(row)
+    result['tickets'] = rows_to_list(
+        db.execute('SELECT * FROM tickets WHERE requester_id = ?', (args.id,)).fetchall()
+    )
+    output_json(result)
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_contacts_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if not data.get('name') and not (data.get('first_name') or data.get('last_name')):
+        deny('contacts create requires "name" or "first_name"/"last_name" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create contact', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('name', 'first_name', 'last_name', 'email', 'phone', 'mobile',
+               'job_title', 'address', 'company_id', 'active', 'vip', 'tags',
+               'other_emails', 'preferred_source', 'freshdesk_id')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO contacts ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM contacts WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+def cmd_contacts_update(args, cmd_str):
+    if args.id is None:
+        deny('contacts update requires an ID', cmd_str)
+    data = _parse_json_arg(args, cmd_str)
+    if not data:
+        deny('contacts update requires at least one field in JSON', cmd_str)
+    _write_gate(args, cmd_str, f'Update contact {args.id}', data)
+    db = get_db()
+    existing = db.execute('SELECT id FROM contacts WHERE id = ?', (args.id,)).fetchone()
+    if not existing:
+        output_json({'error': f'contact {args.id} not found'})
+        sys.exit(1)
+    allowed = ('name', 'first_name', 'last_name', 'email', 'phone', 'mobile',
+               'job_title', 'address', 'company_id', 'active', 'vip', 'tags',
+               'other_emails', 'preferred_source', 'freshdesk_id')
+    sets = []
+    vals = []
+    for k in allowed:
+        if k in data:
+            sets.append(f'{k} = ?')
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    if not sets:
+        deny('no valid fields to update', cmd_str)
+    sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+    vals.append(args.id)
+    try:
+        db.execute(f'UPDATE contacts SET {", ".join(sets)} WHERE id = ?', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM contacts WHERE id = ?', (args.id,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+# --- Command: tickets ---
+
+def cmd_tickets_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    query = (
+        'SELECT t.*, ts.name AS status_name, co.name AS requester_name, c.name AS company_name '
+        'FROM tickets t '
+        'LEFT JOIN ticket_statuses ts ON t.status = ts.status_id '
+        'LEFT JOIN contacts co ON t.requester_id = co.id '
+        'LEFT JOIN companies c ON t.company_id = c.id'
+    )
+    params = []
+    conditions = []
+    if args.company_id is not None:
+        conditions.append('t.company_id = ?')
+        params.append(args.company_id)
+    if args.status is not None:
+        conditions.append('t.status = ?')
+        params.append(args.status)
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    query += ' ORDER BY t.created_at DESC'
+    rows = db.execute(query, params).fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_tickets_view(args, cmd_str):
+    if args.id is None:
+        deny('tickets view requires an ID', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute('SELECT * FROM tickets WHERE id = ?', (args.id,)).fetchone()
+    if not row:
+        output_json({'error': f'ticket {args.id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    output_json(dict(row))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_tickets_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if 'subject' not in data or not data['subject']:
+        deny('tickets create requires "subject" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create ticket', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('subject', 'status', 'priority', 'source', 'type', 'company_id',
+               'requester_id', 'responder_id', 'group_id', 'product_id', 'tags',
+               'custom_fields', 'due_by', 'is_escalated', 'freshdesk_id')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO tickets ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM tickets WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+def cmd_tickets_update(args, cmd_str):
+    if args.id is None:
+        deny('tickets update requires an ID', cmd_str)
+    data = _parse_json_arg(args, cmd_str)
+    if not data:
+        deny('tickets update requires at least one field in JSON', cmd_str)
+    _write_gate(args, cmd_str, f'Update ticket {args.id}', data)
+    db = get_db()
+    existing = db.execute('SELECT id FROM tickets WHERE id = ?', (args.id,)).fetchone()
+    if not existing:
+        output_json({'error': f'ticket {args.id} not found'})
+        sys.exit(1)
+    allowed = ('subject', 'status', 'priority', 'source', 'type', 'company_id',
+               'requester_id', 'responder_id', 'group_id', 'product_id', 'tags',
+               'custom_fields', 'due_by', 'is_escalated', 'freshdesk_id')
+    sets = []
+    vals = []
+    for k in allowed:
+        if k in data:
+            sets.append(f'{k} = ?')
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    if not sets:
+        deny('no valid fields to update', cmd_str)
+    sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+    vals.append(args.id)
+    try:
+        db.execute(f'UPDATE tickets SET {", ".join(sets)} WHERE id = ?', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM tickets WHERE id = ?', (args.id,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+# --- Command: files ---
+
+def cmd_files_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    if args.company_id is not None:
+        rows = db.execute(
+            'SELECT df.* FROM drive_files df '
+            'JOIN company_files cf ON cf.file_id = df.id '
+            'WHERE cf.company_id = ? ORDER BY df.name',
+            (args.company_id,),
+        ).fetchall()
+    else:
+        rows = db.execute('SELECT * FROM drive_files ORDER BY name').fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_files_link(args, cmd_str):
+    if args.company_id is None or args.file_id is None:
+        deny('files link requires --company-id and --file-id', cmd_str)
+    data = {'company_id': args.company_id, 'file_id': args.file_id}
+    _write_gate(args, cmd_str, f'Link file {args.file_id} to company {args.company_id}', data)
+    db = get_db()
+    # Verify both exist
+    if not db.execute('SELECT id FROM companies WHERE id = ?', (args.company_id,)).fetchone():
+        output_json({'error': f'company {args.company_id} not found'})
+        sys.exit(1)
+    if not db.execute('SELECT id FROM drive_files WHERE id = ?', (args.file_id,)).fetchone():
+        output_json({'error': f'file {args.file_id} not found'})
+        sys.exit(1)
+    try:
+        db.execute(
+            'INSERT OR IGNORE INTO company_files (company_id, file_id) VALUES (?, ?)',
+            (args.company_id, args.file_id),
+        )
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    output_json({'linked': True, 'company_id': args.company_id, 'file_id': args.file_id})
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+def cmd_files_unlink(args, cmd_str):
+    if args.company_id is None or args.file_id is None:
+        deny('files unlink requires --company-id and --file-id', cmd_str)
+    data = {'company_id': args.company_id, 'file_id': args.file_id}
+    _write_gate(args, cmd_str, f'Unlink file {args.file_id} from company {args.company_id}', data)
+    db = get_db()
+    try:
+        cursor = db.execute(
+            'DELETE FROM company_files WHERE company_id = ? AND file_id = ?',
+            (args.company_id, args.file_id),
+        )
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    output_json({
+        'unlinked': cursor.rowcount > 0,
+        'company_id': args.company_id,
+        'file_id': args.file_id,
+    })
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+# --- Helpers ---
+
+def _parse_json_arg(args, cmd_str):
+    if not args.json:
+        deny('--json is required for this operation', cmd_str)
+    try:
+        data = json.loads(args.json)
+    except json.JSONDecodeError as e:
+        deny(f'invalid JSON: {e}', cmd_str)
+    if not isinstance(data, dict):
+        deny('JSON must be an object', cmd_str)
+    return data
+
+
+def _build_cmd_str(args):
+    """Build the canonical command string (without --confirmed) for nonce matching."""
+    parts = ['crm']
+    parts.append(args.resource)
+    parts.append(args.action)
+    if getattr(args, 'id', None) is not None:
+        parts.append(str(args.id))
+    if getattr(args, 'json', None):
+        parts.append('--json')
+        parts.append(args.json)
+    if getattr(args, 'company_id', None) is not None:
+        parts.append('--company-id')
+        parts.append(str(args.company_id))
+    if getattr(args, 'file_id', None) is not None:
+        parts.append('--file-id')
+        parts.append(str(args.file_id))
+    if getattr(args, 'status', None) is not None:
+        parts.append('--status')
+        parts.append(str(args.status))
+    return ' '.join(parts)
+
+
+def _write_gate(args, cmd_str, operation_desc, preview_data):
+    """Enforce dry-run/confirmation for write operations."""
+    if args.confirmed:
+        ok, err = verify_nonce(args.confirmed, cmd_str)
+        if not ok:
+            log_entry(cmd_str, f'BLOCKED: {err}')
+            output_json({'error': f'BLOCKED: {err}'})
+            sys.exit(1)
+        log_entry(cmd_str, 'CONFIRMED')
+        return  # Proceed with write
+
+    # Dry-run: show what would happen and generate nonce
+    nonce = generate_nonce()
+    save_nonce(nonce, cmd_str)
+    log_entry(cmd_str, 'DRY-RUN-ENFORCED')
+    output_json({
+        'dry_run': True,
+        'operation': operation_desc,
+        'data': preview_data,
+        'nonce': nonce,
+        'message': f'To execute, re-run with --confirmed {nonce}',
+    })
+    sys.exit(2)
+
+
+# --- Argument Parsing ---
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog='crm-safe',
+        description='Safe CRM database wrapper',
+    )
+    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files'])
+    parser.add_argument('action')
+    parser.add_argument('id', nargs='?', type=int, default=None)
+    parser.add_argument('--json', dest='json', default=None)
+    parser.add_argument('--company-id', type=int, default=None)
+    parser.add_argument('--file-id', type=int, default=None)
+    parser.add_argument('--status', type=int, default=None)
+    parser.add_argument('--confirmed', default=None)
+    return parser
+
+
+# --- Routing ---
+
+ROUTES = {
+    'companies:list': cmd_companies_list,
+    'companies:view': cmd_companies_view,
+    'companies:create': cmd_companies_create,
+    'companies:update': cmd_companies_update,
+    'contacts:list': cmd_contacts_list,
+    'contacts:view': cmd_contacts_view,
+    'contacts:create': cmd_contacts_create,
+    'contacts:update': cmd_contacts_update,
+    'tickets:list': cmd_tickets_list,
+    'tickets:view': cmd_tickets_view,
+    'tickets:create': cmd_tickets_create,
+    'tickets:update': cmd_tickets_update,
+    'files:list': cmd_files_list,
+    'files:link': cmd_files_link,
+    'files:unlink': cmd_files_unlink,
+}
+
+
+def main():
+    init()
+
+    if len(sys.argv) < 3:
+        output_json({'error': 'Usage: crm-safe <resource> <action> [options]'})
+        sys.exit(1)
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    cmd_str = _build_cmd_str(args)
+
+    route_key = f'{args.resource}:{args.action}'
+    handler = ROUTES.get(route_key)
+    if not handler:
+        deny(f"command '{args.resource} {args.action}' is not in the allowlist", cmd_str)
+
+    handler(args, cmd_str)
+
+
+if __name__ == '__main__':
+    main()

@@ -36,6 +36,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 
 | Agent | Role | File |
 |-------|------|------|
+| Angela | Database Specialist — designs schemas, manages structured data, ensures data integrity | `.claude/agents/angela.md` |
 | Oscar | Senior Researcher — researches requirements, validates information, provides structured insights | `.claude/agents/oscar.md` |
 | Toby | HR / Agent Creator — creates, onboards, and governs new AI agents | `.claude/agents/toby.md` |
 | Dwight | Organization & Enforcement — enforces security policies, reviews permissions and data access | `.claude/agents/dwight.md` |

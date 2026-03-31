@@ -1,0 +1,138 @@
+-- CRM Schema: tracks companies, contacts, tickets, and drive files
+-- SQLite with ISO 8601 TEXT dates, JSON arrays as TEXT, FreshDesk IDs stored separately
+
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+-- ============================================================
+-- Companies
+-- Central entity linking contacts, tickets, and files.
+-- Can originate from FreshDesk or be created independently.
+-- ============================================================
+CREATE TABLE companies (
+    id              INTEGER PRIMARY KEY,
+    freshdesk_id    INTEGER UNIQUE,         -- FreshDesk company ID (nullable, large int)
+    name            TEXT NOT NULL,
+    description     TEXT,
+    domains         TEXT,                   -- JSON array of email domains, e.g. ["acme.com","acme.org"]
+    health_score    TEXT,
+    account_tier    TEXT,
+    industry        TEXT,
+    renewal_date    TEXT,                   -- ISO 8601
+    custom_fields   TEXT,                   -- JSON object
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_companies_freshdesk_id ON companies(freshdesk_id) WHERE freshdesk_id IS NOT NULL;
+CREATE INDEX idx_companies_name ON companies(name);
+
+-- ============================================================
+-- Contacts
+-- People associated with companies. FreshDesk is the primary
+-- source but contacts can exist without a FreshDesk record.
+-- ============================================================
+CREATE TABLE contacts (
+    id              INTEGER PRIMARY KEY,
+    freshdesk_id    INTEGER UNIQUE,         -- FreshDesk contact ID (nullable, large int)
+    company_id      INTEGER REFERENCES companies(id),
+    name            TEXT,
+    first_name      TEXT,
+    last_name       TEXT,
+    email           TEXT,
+    phone           TEXT,
+    mobile          TEXT,
+    job_title       TEXT,
+    address         TEXT,
+    active          INTEGER DEFAULT 1 CHECK (active IN (0, 1)),
+    vip             INTEGER DEFAULT 0 CHECK (vip IN (0, 1)),
+    tags            TEXT,                   -- JSON array
+    other_emails    TEXT,                   -- JSON array
+    preferred_source TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_contacts_freshdesk_id ON contacts(freshdesk_id) WHERE freshdesk_id IS NOT NULL;
+CREATE INDEX idx_contacts_company_id ON contacts(company_id) WHERE company_id IS NOT NULL;
+CREATE INDEX idx_contacts_email ON contacts(email) WHERE email IS NOT NULL;
+
+-- ============================================================
+-- Ticket statuses
+-- Lookup table for FreshDesk ticket status codes.
+-- ============================================================
+CREATE TABLE ticket_statuses (
+    status_id   INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL
+);
+
+INSERT INTO ticket_statuses (status_id, name) VALUES
+    (2, 'Open'),
+    (3, 'Pending'),
+    (4, 'Resolved'),
+    (5, 'Closed'),
+    (6, 'Custom 1'),
+    (7, 'Custom 2'),
+    (9, 'Custom 3');
+
+-- ============================================================
+-- Tickets
+-- Support tickets from FreshDesk. Linked to companies and
+-- contacts where available.
+-- ============================================================
+CREATE TABLE tickets (
+    id              INTEGER PRIMARY KEY,
+    freshdesk_id    INTEGER UNIQUE,
+    subject         TEXT,
+    status          INTEGER REFERENCES ticket_statuses(status_id),
+    priority        INTEGER CHECK (priority BETWEEN 1 AND 4),  -- 1=Low, 2=Med, 3=High, 4=Urgent
+    source          INTEGER,                                    -- 1=Email, etc.
+    type            TEXT,
+    company_id      INTEGER REFERENCES companies(id),
+    requester_id    INTEGER REFERENCES contacts(id),
+    responder_id    INTEGER,
+    group_id        INTEGER,
+    product_id      INTEGER,
+    tags            TEXT,                   -- JSON array
+    custom_fields   TEXT,                   -- JSON object
+    due_by          TEXT,                   -- ISO 8601
+    is_escalated    INTEGER DEFAULT 0 CHECK (is_escalated IN (0, 1)),
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_tickets_freshdesk_id ON tickets(freshdesk_id) WHERE freshdesk_id IS NOT NULL;
+CREATE INDEX idx_tickets_company_id ON tickets(company_id) WHERE company_id IS NOT NULL;
+CREATE INDEX idx_tickets_requester_id ON tickets(requester_id) WHERE requester_id IS NOT NULL;
+CREATE INDEX idx_tickets_status ON tickets(status);
+
+-- ============================================================
+-- Drive files
+-- Google Drive file metadata. Linked to companies via the
+-- company_files junction table.
+-- ============================================================
+CREATE TABLE drive_files (
+    id              INTEGER PRIMARY KEY,
+    google_file_id  TEXT UNIQUE NOT NULL,   -- Google Drive file ID (string)
+    name            TEXT,
+    mime_type       TEXT,
+    web_view_link   TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_drive_files_google_id ON drive_files(google_file_id);
+
+-- ============================================================
+-- Company-file links
+-- Junction table for many-to-many relationship between
+-- companies and drive files. Supports manual linking.
+-- ============================================================
+CREATE TABLE company_files (
+    company_id  INTEGER NOT NULL REFERENCES companies(id),
+    file_id     INTEGER NOT NULL REFERENCES drive_files(id),
+    linked_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (company_id, file_id)
+);
+
+CREATE INDEX idx_company_files_file_id ON company_files(file_id);

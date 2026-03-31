@@ -14,6 +14,12 @@ if echo "$COMMAND" | grep -qE '(gws-safe|freshdesk-safe|crm-safe)'; then
   fi
 elif echo "$COMMAND" | grep -qE '^date\b'; then
   echo '{"decision":"allow"}'
+elif echo "$COMMAND" | head -n1 | grep -qE '^python3\s+<<'; then
+  if echo "$COMMAND" | grep -qE '(import\s+(os|sys|subprocess|socket|urllib|requests|http|shutil|pathlib)|from\s+(os|sys|subprocess|socket|urllib|requests|http|shutil|pathlib)\s+import|open\s*\()'; then
+    echo '{}'
+  else
+    echo '{"decision":"allow"}'
+  fi
 else
   # Not a recognized command, pass through to normal permission handling
   echo '{}'

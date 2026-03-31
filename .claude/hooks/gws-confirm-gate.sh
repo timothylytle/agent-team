@@ -6,7 +6,7 @@
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
 
-if echo "$COMMAND" | grep -qE '(gws-safe|freshdesk-safe)'; then
+if echo "$COMMAND" | grep -qE '(gws-safe|freshdesk-safe|crm-safe)'; then
   if echo "$COMMAND" | grep -q -- '--confirmed'; then
     echo '{"decision":"ask","reason":"Write operation requires approval"}'
   else

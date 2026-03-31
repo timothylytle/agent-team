@@ -24,6 +24,7 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `freshdesk-safe tickets view ID [--include conversations]` — view a single ticket
 - `freshdesk-safe tickets search --query "..."` — search tickets (FreshDesk query syntax)
 - `freshdesk-safe tickets note ID --body "..." [--private true] [--confirmed NONCE]` — add a note to a ticket (dry-run enforced)
+- `freshdesk-safe tickets note-update TICKET_ID NOTE_ID --body "new body" [--confirmed NONCE]` — update an existing note on a ticket (dry-run enforced)
 
 ### Contacts (read-only)
 

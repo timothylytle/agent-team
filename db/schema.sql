@@ -73,7 +73,7 @@ INSERT INTO ticket_statuses (status_id, name) VALUES
     (5, 'Closed'),
     (6, 'Custom 1'),
     (7, 'Custom 2'),
-    (9, 'Custom 3');
+    (9, 'Scheduled');
 
 -- ============================================================
 -- Tickets
@@ -136,3 +136,28 @@ CREATE TABLE company_files (
 );
 
 CREATE INDEX idx_company_files_file_id ON company_files(file_id);
+
+-- ============================================================
+-- Meetings
+-- Calendar events linked to support tickets, contacts, and
+-- companies. Google Calendar is the source of truth.
+-- ============================================================
+CREATE TABLE meetings (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_event_id     TEXT UNIQUE NOT NULL,   -- Google Calendar event ID
+    ticket_id           INTEGER REFERENCES tickets(id),
+    contact_id          INTEGER REFERENCES contacts(id),
+    company_id          INTEGER REFERENCES companies(id),
+    summary             TEXT,                   -- Event title
+    start_time          TEXT,                   -- ISO 8601
+    end_time            TEXT,                   -- ISO 8601
+    html_link           TEXT,                   -- Google Calendar web link
+    freshdesk_ticket_id INTEGER,                -- FreshDesk ticket ID
+    freshdesk_note_id   INTEGER,                -- FreshDesk note/conversation ID
+    color_id            TEXT,                   -- Calendar event colorId
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_meetings_google_event_id ON meetings(google_event_id);
+CREATE INDEX idx_meetings_ticket_id ON meetings(ticket_id) WHERE ticket_id IS NOT NULL;

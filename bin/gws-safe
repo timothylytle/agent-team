@@ -52,6 +52,7 @@ is_confirmed_eligible() {
     "drive files copy"
     "calendar events insert"
     "calendar events update"
+    "calendar events patch"
     "calendar events quickAdd"
     "gmail users messages send"
     "gmail users drafts create"

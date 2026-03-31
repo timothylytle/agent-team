@@ -331,6 +331,69 @@ print(json.dumps({'body': sys.argv[1], 'private': sys.argv[2].lower() == 'true'}
   exit 2
 }
 
+cmd_tickets_note_update() {
+  if (( $# < 2 )); then
+    deny "tickets note-update requires a ticket ID and a note ID"
+  fi
+
+  local ticket_id="$1"; shift
+  [[ -z "$ticket_id" ]] && deny "ticket ID must not be empty"
+  [[ "$ticket_id" =~ ^[0-9]+$ ]] || deny "ticket ID must be numeric"
+
+  local note_id="$1"; shift
+  [[ -z "$note_id" ]] && deny "note ID must not be empty"
+  [[ "$note_id" =~ ^[0-9]+$ ]] || deny "note ID must be numeric"
+
+  local body=""
+  local confirmed_nonce=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --body)       body="$2"; shift 2 ;;
+      --confirmed)  confirmed_nonce="$2"; shift 2 ;;
+      *)            deny "unknown option for tickets note-update: $1" ;;
+    esac
+  done
+
+  if [[ -z "$body" ]]; then
+    deny "tickets note-update requires --body"
+  fi
+
+  # Build CMD_STR without --confirmed for nonce matching
+  local match_cmd="freshdesk tickets note-update ${ticket_id} ${note_id} --body ${body}"
+
+  if [[ -n "$confirmed_nonce" ]]; then
+    # Layer 3: Human-in-the-loop confirmation
+    verify_nonce "$confirmed_nonce" "$match_cmd"
+    log_entry "$CMD_STR" "HUMAN-APPROVED"
+
+    local json_body
+    json_body=$(python3 -c "
+import json,sys
+print(json.dumps({'body': sys.argv[1]}))
+" "$body")
+
+    local rc=0
+    api_call PUT "/conversations/${note_id}" -d "$json_body" || rc=$?
+    log_entry "$CMD_STR" "HUMAN-APPROVED" "$rc"
+    exit "$rc"
+  fi
+
+  # Layer 2: Dry-run enforced
+  local nonce
+  nonce=$(generate_nonce)
+  save_nonce "$nonce" "$match_cmd"
+  log_entry "$CMD_STR" "DRY-RUN-ENFORCED"
+
+  echo "freshdesk-safe: DRY-RUN-ENFORCED — write operation requires confirmation" >&2
+  echo "" >&2
+  echo "Operation: Update note #${note_id} on ticket #${ticket_id}" >&2
+  echo "Body:      ${body}" >&2
+  echo "" >&2
+  echo "To execute, re-run with: freshdesk-safe tickets note-update ${ticket_id} ${note_id} --body \"...\" --confirmed ${nonce}" >&2
+  exit 2
+}
+
 cmd_contacts_list() {
   local -a params=()
   while (( $# > 0 )); do
@@ -386,6 +449,7 @@ Commands:
   tickets view    ID [--include conversations]
   tickets search  --query "status:2 AND priority:4"
   tickets note    ID --body "note text" [--private true] [--confirmed NONCE]
+  tickets note-update TICKET_ID NOTE_ID --body "new body" [--confirmed NONCE]
   contacts list   [--page N] [--per_page N]
   contacts view   ID
 
@@ -420,6 +484,7 @@ main() {
     tickets:view)    load_config; cmd_tickets_view "$@" ;;
     tickets:search)  load_config; cmd_tickets_search "$@" ;;
     tickets:note)    load_config; cmd_tickets_note "$@" ;;
+    tickets:note-update) load_config; cmd_tickets_note_update "$@" ;;
     contacts:list)   load_config; cmd_contacts_list "$@" ;;
     contacts:view)   load_config; cmd_contacts_view "$@" ;;
     *)

@@ -42,6 +42,15 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `crm-safe tickets create --json '{"subject":"Issue with login","status":2,"company_id":1}'` — create a ticket (dry-run enforced)
 - `crm-safe tickets update ID --json '{"status":4}'` — update a ticket (dry-run enforced)
 
+### Meetings (read + write)
+
+- `crm-safe meetings list` — list all meetings
+- `crm-safe meetings list --company-id ID` — list meetings for a specific company
+- `crm-safe meetings list --ticket-id ID` — list meetings for a specific ticket
+- `crm-safe meetings view ID` — view a single meeting
+- `crm-safe meetings create --json '{"google_event_id":"...","ticket_id":1,"contact_id":1,"company_id":1,"summary":"...","start_time":"...","end_time":"...","html_link":"...","freshdesk_ticket_id":123,"color_id":"4"}'` — create a meeting (dry-run enforced, `google_event_id` required)
+- `crm-safe meetings update ID --json '{"freshdesk_note_id":456}'` — update a meeting (dry-run enforced)
+
 ### Files (read + create + link/unlink)
 
 - `crm-safe files list` — list all drive files
@@ -75,6 +84,9 @@ Lookup table: `status_id`, `name`
 
 ### drive_files
 Key fields: `id`, `google_file_id`, `name`, `mime_type`, `web_view_link`
+
+### meetings
+Key fields: `id`, `google_event_id`, `ticket_id` (FK to tickets), `contact_id` (FK to contacts), `company_id` (FK to companies), `summary`, `start_time`, `end_time`, `html_link`, `freshdesk_ticket_id`, `freshdesk_note_id`, `color_id`
 
 ### company_files
 Junction table: `company_id` (FK to companies), `file_id` (FK to drive_files), `linked_at`

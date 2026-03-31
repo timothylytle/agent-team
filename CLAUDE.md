@@ -55,6 +55,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | CRM | CRM Database Interface — executes CRM operations safely through the crm-safe wrapper | `.claude/skills/crm/SKILL.md` |
 | Daily Log | Creates and updates a daily log entry in a Google Doc with calendar events, tasks, and note sections | `.claude/skills/daily-log/SKILL.md` |
 | Support Notes | Creates support note documents in Google Drive for open FreshDesk tickets and links them back via private notes | `.claude/skills/support-notes/SKILL.md` |
+| Support Calendar | Matches calendar events to FreshDesk tickets, creates CRM meeting records, updates ticket notes and calendar event details | `.claude/skills/support-calendar/SKILL.md` |
 
 ## Hiring Process
 

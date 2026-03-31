@@ -44,7 +44,8 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `gws-safe calendar events list --params '{"calendarId":"primary"}'` — list events
 - `gws-safe calendar events get --params '{"calendarId":"primary","eventId":"..."}'` — event details
 - `gws-safe calendar events insert` — create event (dry-run enforced)
-- `gws-safe calendar events update` — modify event (dry-run enforced)
+- `gws-safe calendar events update` — full replace event (dry-run enforced)
+- `gws-safe calendar events patch` — partial update event (dry-run enforced)
 - `gws-safe calendar events quickAdd` — quick-add from text (dry-run enforced)
 - `gws-safe calendar calendarList list` — list calendars
 

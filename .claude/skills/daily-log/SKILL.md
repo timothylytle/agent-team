@@ -9,10 +9,8 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 
 - **GWS wrapper:** `/home/timothylytle/agent-team/bin/gws-safe`
 - **Config file:** `/home/timothylytle/agent-team/config/daily_log.json`
-- **In-progress task list ID:** `TG16TWFNTkNRblVkdHdhbQ`
-- **Waiting task list ID:** `ZGRjdFdTV19KWGkxVTdMbg`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
-- **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip)
+- **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip), `inProgressTaskListId` (in-progress task list), `waitingTaskListId` (waiting task list)
 
 ## Command Rules
 
@@ -81,14 +79,15 @@ After fetching events, filter out:
 
 If `excludeEventColorIds` is not set in the config, do not filter by color.
 
-**In-progress tasks:**
+**In-progress tasks:** Use `inProgressTaskListId` and `waitingTaskListId` from the config file read in Step 1.
+
 ```bash
-gws-safe tasks tasks list --params '{"tasklist":"TG16TWFNTkNRblVkdHdhbQ","showAssigned":true}'
+gws-safe tasks tasks list --params '{"tasklist":"<IN_PROGRESS_TASK_LIST_ID>","showAssigned":true}'
 ```
 
 **Waiting tasks:**
 ```bash
-gws-safe tasks tasks list --params '{"tasklist":"ZGRjdFdTV19KWGkxVTdMbg","showAssigned":true}'
+gws-safe tasks tasks list --params '{"tasklist":"<WAITING_TASK_LIST_ID>","showAssigned":true}'
 ```
 After fetching waiting tasks, filter the results to only include tasks where `due` matches today's date (format: `YYYY-MM-DDT00:00:00.000Z`). Tasks with future or past due dates should be excluded from the Waiting / Blockers section.
 

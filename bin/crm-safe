@@ -462,6 +462,35 @@ def cmd_files_list(args, cmd_str):
     log_entry(cmd_str, 'ALLOWED', 0)
 
 
+def cmd_files_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if 'google_file_id' not in data or not data['google_file_id']:
+        deny('files create requires "google_file_id" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create drive file', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('google_file_id', 'name', 'mime_type', 'web_view_link')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO drive_files ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM drive_files WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
 def cmd_files_link(args, cmd_str):
     if args.company_id is None or args.file_id is None:
         deny('files link requires --company-id and --file-id', cmd_str)
@@ -606,6 +635,7 @@ ROUTES = {
     'tickets:create': cmd_tickets_create,
     'tickets:update': cmd_tickets_update,
     'files:list': cmd_files_list,
+    'files:create': cmd_files_create,
     'files:link': cmd_files_link,
     'files:unlink': cmd_files_unlink,
 }

@@ -42,10 +42,11 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `crm-safe tickets create --json '{"subject":"Issue with login","status":2,"company_id":1}'` — create a ticket (dry-run enforced)
 - `crm-safe tickets update ID --json '{"status":4}'` — update a ticket (dry-run enforced)
 
-### Files (read + link/unlink)
+### Files (read + create + link/unlink)
 
 - `crm-safe files list` — list all drive files
 - `crm-safe files list --company-id ID` — list files linked to a specific company
+- `crm-safe files create --json '{"google_file_id":"...","name":"...","mime_type":"...","web_view_link":"..."}'` — create a drive file record (dry-run enforced, `google_file_id` required)
 - `crm-safe files link --company-id ID --file-id ID` — link a file to a company (dry-run enforced)
 - `crm-safe files unlink --company-id ID --file-id ID` — unlink a file from a company (dry-run enforced)
 

@@ -54,7 +54,11 @@ daily-log-cache get <DOC_ID> <TODAY_DATE>
 ```
 Where `<TODAY_DATE>` is today in `YYYY-MM-DD` format.
 
-If the cache returns data (not `{"cached": false}`), extract the `task_list` section boundaries (`start_index`, `end_index`) and the `notes` section with its subsections. Skip to Step 4 (fetch fresh data). You still need the doc content for comparison but you already know where to look.
+If the cache returns data (not `{"cached": false}`), extract:
+- The `task_list` section boundaries (`start_index`, `end_index`)
+- The `notes` section start/end boundaries (to know where Notes lives in the doc)
+
+Do NOT use cached subsection data for the Notes section — subsection indices change as the user types notes throughout the day, making cached subsection data stale. You still need to fetch the doc content to read the current Notes HEADING_3 subsections (within the Notes section boundaries) and to compare Task List content. Skip to Step 4 (fetch fresh data).
 
 If the cache misses, proceed to Step 3.
 
@@ -110,7 +114,7 @@ Compare the fetched data with the current doc content in the Task List section. 
 - New tasks not already listed in Priorities
 - Tasks that have been completed (in the doc but no longer in the task list)
 - Changes to the Waiting / Blockers list
-- New events/tasks that need HEADING_3 sub-sections under Notes
+- New events/tasks that need HEADING_3 sub-sections under Notes (existing HEADING_3 titles must be read from the live document content within the Notes section boundaries, not from the cache)
 
 ## Step 6: Apply updates via batchUpdate
 

@@ -93,22 +93,22 @@ freshdesk-safe contacts view <REQUESTER_ID>
 ```
 Use the contact's `name` as the customer name. If the contact lookup fails, use "Unknown" as the customer name.
 
-## Step 5: Compare and build updates
+## Step 5: Compare and identify new tickets
 
-Compare the fetched tickets with the current Open Tickets content in the doc. Identify:
+Compare the fetched tickets with the current Open Tickets content in the doc. Extract the ticket IDs from existing entries by looking for `[<number>]` patterns at the start of each line in the section.
 
-- New tickets not already listed
-- Tickets that are no longer open (in doc but not in search results)
+Identify only tickets from the FreshDesk results whose ID does not appear in the existing entries. These are new tickets to append.
+
+Do NOT remove, modify, or reorder existing entries. The user manually updates these throughout the day (checking them complete, changing status, converting to tasks).
 
 ## Step 6: Apply updates via batchUpdate
 
-If there are changes, build a batchUpdate request that replaces the Open Tickets section content (between the "Open Tickets:" HEADING_2 and the next HEADING_2).
+If there are new tickets to add, build a batchUpdate request that appends them to the end of the Open Tickets section.
 
-1. Delete existing content between the section boundaries (after the "Open Tickets:" heading line, before the next HEADING_2)
-2. Insert new ticket lines at the start of the cleared section
-3. Format: `[<ticket-id>] customer - subject - https://miarec.freshdesk.com/a/tickets/<ticket-id>` for each ticket, or `None` if no open tickets
-4. Apply `createParagraphBullets` with `bulletPreset: "BULLET_CHECKBOX"` on the ticket items
-5. Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` on the ticket items
+1. Insert new ticket lines at the end of the existing Open Tickets content (just before the next HEADING_2 paragraph). The insert index is the `startIndex` of the next HEADING_2 after "Open Tickets:" (i.e., the section `end_index` from the cache or parsed structure).
+2. Format each new ticket as: `[<ticket-id>] customer - subject - https://miarec.freshdesk.com/a/tickets/<ticket-id>` followed by a newline
+3. Apply `createParagraphBullets` with `bulletPreset: "BULLET_CHECKBOX"` on the new ticket items
+4. Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` on the new ticket items
 
 Execute the batchUpdate:
 ```bash
@@ -116,9 +116,9 @@ gws-safe docs documents batchUpdate --json '{"requests":[...]}' --params '{"docu
 ```
 This is a write operation. Present the dry-run to the user, get confirmation, then execute with `--confirmed <nonce>`.
 
-If there are no changes to make, report "Open Tickets is already up to date" and stop without executing a batchUpdate.
+If there are no new tickets to add, report "Open Tickets is already up to date" and stop without executing a batchUpdate.
 
-Report what was updated.
+Report how many new tickets were appended and their IDs.
 
 ## Step 7: Update cache
 

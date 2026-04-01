@@ -201,16 +201,27 @@ For each matched event, update the description and conditionally update the summ
 
 **Summary rule:** Only update the summary if the current summary matches the default booking pattern `<N>min Support Session (...)` (e.g., "60min Support Session (Tim Carter)"). If the summary has already been customized to something else, leave it as-is.
 
-**Description:** Always update the description with the FreshDesk ticket link. If a support doc exists (found in Step 6 from the existing "Support notes:" note body), include the Support Doc link as well. If no support doc exists, omit that line.
+**Description:** Preserve the existing event description (which may contain connection info like Zoom links, dial-in numbers, etc.). Read the current `description` from the event data fetched in Step 1.
+
+- If the description already contains `miarec.freshdesk.com/a/tickets/`, do not modify the description.
+- If the description does NOT contain the FreshDesk link, prepend the links to the existing description with a blank line separator:
+  ```
+  FreshDesk: https://miarec.freshdesk.com/a/tickets/<FRESHDESK_TICKET_ID>
+  Support Doc: https://docs.google.com/document/d/<DOC_ID>/edit
+
+  <EXISTING_DESCRIPTION>
+  ```
+  If no support doc exists, omit the "Support Doc:" line.
+  If the existing description is empty, just use the links without the blank line.
 
 If the summary should be updated:
 ```bash
-gws-safe calendar events patch --params '{"calendarId":"primary","eventId":"EVENT_ID"}' --json '{"summary":"<company-name> | miarec - [<ticket-id>] - <ticket-subject>","description":"FreshDesk: https://miarec.freshdesk.com/a/tickets/<FRESHDESK_TICKET_ID>\nSupport Doc: https://docs.google.com/document/d/<DOC_ID>/edit"}'
+gws-safe calendar events patch --params '{"calendarId":"primary","eventId":"EVENT_ID"}' --json '{"summary":"<company-name> | miarec - [<ticket-id>] - <ticket-subject>","description":"FreshDesk: https://miarec.freshdesk.com/a/tickets/<FRESHDESK_TICKET_ID>\nSupport Doc: https://docs.google.com/document/d/<DOC_ID>/edit\n\n<EXISTING_DESCRIPTION>"}'
 ```
 
 If the summary should NOT be updated (non-default name):
 ```bash
-gws-safe calendar events patch --params '{"calendarId":"primary","eventId":"EVENT_ID"}' --json '{"description":"FreshDesk: https://miarec.freshdesk.com/a/tickets/<FRESHDESK_TICKET_ID>\nSupport Doc: https://docs.google.com/document/d/<DOC_ID>/edit"}'
+gws-safe calendar events patch --params '{"calendarId":"primary","eventId":"EVENT_ID"}' --json '{"description":"FreshDesk: https://miarec.freshdesk.com/a/tickets/<FRESHDESK_TICKET_ID>\nSupport Doc: https://docs.google.com/document/d/<DOC_ID>/edit\n\n<EXISTING_DESCRIPTION>"}'
 ```
 
 - **summary format (when updating):** `<company-name> | miarec - [<ticket-id>] - <ticket-subject>` where `ticket-id` is the FreshDesk ticket ID.

@@ -11,6 +11,7 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 - **Config file:** `/home/timothylytle/agent-team/config/daily_log.json`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
 - **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip), `inProgressTaskListId` (in-progress task list), `waitingTaskListId` (waiting task list)
+- **Cache wrapper:** `/home/timothylytle/agent-team/bin/daily-log-cache`
 - **FreshDesk wrapper:** `/home/timothylytle/agent-team/bin/freshdesk-safe`
 - **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
 
@@ -168,45 +169,23 @@ After the batchUpdate succeeds, re-read the document using `docs documents get` 
 
 If formatting is incorrect, report the discrepancy to the user rather than attempting to fix it automatically.
 
-After successful verification, report what was created: number of events, tasks, and the random fact.
+After successful verification, populate the cache with the full document structure. Parse ALL entries in the document (not just today's) and their sections/subsections:
+```bash
+daily-log-cache populate --json '{"document_id":"<DOC_ID>","revision_id":"<REVISION_ID>","entries":[...]}'
+```
+This ensures the cache is warm for the sub-skill calls in Step 4.
+
+Report what was created: number of events, tasks, and the random fact.
 
 ## Step 4: Update existing entry
 
 If today's entry already exists:
 
-### 4a: Re-fetch current data
+Read and follow `.claude/skills/task-list/SKILL.md`. It will update the Task List section (priorities, waiting/blockers, and Notes sub-headings) with fresh data.
 
-Run the same calendar, in-progress tasks, waiting tasks, and open tickets commands from Step 3a to get fresh data.
+Then read and follow `.claude/skills/open-tickets/SKILL.md`. It will update the Open Tickets section with current FreshDesk ticket data.
 
-### 4b: Compare and identify changes
-
-Read the current doc content. Find today's entry: it starts at today's HEADING_1 paragraph. The end of today's entry is the `startIndex` of the next HEADING_1 paragraph, or if no next HEADING_1 exists, the `endIndex` of the last element in `body.content`. Identify:
-
-- New calendar events not already listed in Priorities
-- New tasks not already listed in Priorities
-- Tasks that have been completed (in the doc but no longer in the in-progress list)
-- Changes to the waiting/blockers list
-- New open tickets not already listed in Open Tickets
-- Tickets that are no longer open (closed since last update)
-- New events/tasks that need HEADING_3 sub-sections under Notes
-
-### 4c: Apply updates via batchUpdate
-
-Build a batchUpdate request that:
-
-- Adds new priority items to the Priorities bullet list
-- Updates the Waiting / Blockers section with current data
-- Updates the Open Tickets section with current data
-- Adds new HEADING_3 sub-sections at the end of the Notes section for any new tasks/events
-
-**Do NOT overwrite or modify:**
-- Any text the user has typed under existing HEADING_3 sections
-- The Thoughts / Ideas section content
-- The Random Fact section
-
-Execute the batchUpdate with dry-run and confirmation flow.
-
-Report what was updated.
+Report what each sub-skill updated.
 
 ## Step 5: Archive old entries
 
@@ -345,6 +324,21 @@ gws-safe docs documents batchUpdate --json '{"requests":[{"deleteContentRange":{
 ```
 
 **If no old entries exist:** Skip this step silently.
+
+### 5f: Invalidate and repopulate cache
+
+If entries were deleted from the main doc in Step 5e, the cached indices are now stale. Invalidate the cache:
+```bash
+daily-log-cache invalidate <DOC_ID>
+```
+Then re-read the document and populate fresh:
+```bash
+gws-safe docs documents get --params '{"documentId":"<DOC_ID>"}'
+```
+Parse the full document structure (all remaining entries and their sections/subsections) and run:
+```bash
+daily-log-cache populate --json '{"document_id":"<DOC_ID>","revision_id":"<REVISION_ID>","entries":[...]}'
+```
 
 ## Error Handling
 

@@ -58,8 +58,10 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | FreshDesk Active | Active FreshDesk Tickets — retrieves all non-closed, agent-assigned FreshDesk tickets | `.claude/skills/freshdesk-active/SKILL.md` |
 | FreshDesk Notes | FreshDesk Ticket Note Scanner — fetches ticket conversations and searches for specific content in note bodies | `.claude/skills/freshdesk-notes/SKILL.md` |
 | Daily Log | Creates and updates a daily log entry in a Google Doc with calendar events, tasks, and note sections | `.claude/skills/daily-log/SKILL.md` |
+| Open Tickets | Updates Open Tickets section of daily log with current FreshDesk open tickets | `.claude/skills/open-tickets/SKILL.md` |
 | Support Notes | Creates support note documents in Google Drive for open FreshDesk tickets and links them back via private notes | `.claude/skills/support-notes/SKILL.md` |
 | Support Calendar | Matches calendar events to FreshDesk tickets, creates CRM meeting records, updates ticket notes and calendar event details | `.claude/skills/support-calendar/SKILL.md` |
+| Task List | Updates Task List section of daily log with calendar events, tasks, and waiting/blockers | `.claude/skills/task-list/SKILL.md` |
 
 ## Hiring Process
 

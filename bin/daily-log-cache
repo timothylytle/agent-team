@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Daily log document structure cache wrapper.
+
+Provides CLI access to a local SQLite cache of daily log document structure
+(section boundaries, subsections) so sub-skills can locate their target
+sections without parsing the full Google Doc.
+
+Usage: daily-log-cache <command> [options]
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+# --- Paths ---
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, '..', 'db', 'daily_log_cache.db')
+SCHEMA_PATH = os.path.join(SCRIPT_DIR, '..', 'db', 'daily_log_cache_schema.sql')
+LOG_DIR = os.path.join(SCRIPT_DIR, '..', 'logs')
+LOG_FILE = os.path.join(LOG_DIR, 'daily-log-cache.log')
+
+# --- Logging ---
+
+def init():
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def log_entry(cmd, decision, exit_code=None):
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    entry = {
+        'timestamp': ts,
+        'command': cmd,
+        'decision': decision,
+        'exit_code': exit_code,
+    }
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except OSError:
+        pass
+
+
+# --- Database ---
+
+def get_db():
+    if not os.path.isfile(DB_PATH):
+        if not os.path.isfile(SCHEMA_PATH):
+            print(json.dumps({'error': f'schema not found: {SCHEMA_PATH}'}), file=sys.stderr)
+            sys.exit(1)
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+        with open(SCHEMA_PATH) as f:
+            conn.executescript(f.read())
+        conn.close()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
+    return conn
+
+
+# --- Output ---
+
+def output_json(data):
+    print(json.dumps(data, indent=2))
+
+
+# --- Commands ---
+
+def cmd_check(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute(
+        'SELECT document_id, revision_id, fetched_at FROM documents WHERE document_id = ?',
+        (args.document_id,),
+    ).fetchone()
+    db.close()
+    if row:
+        output_json(dict(row))
+    else:
+        output_json({'cached': False})
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_get(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    entry = db.execute(
+        'SELECT e.entry_date, e.heading_text, e.start_index, e.end_index '
+        'FROM entries e WHERE e.document_id = ? AND e.entry_date = ?',
+        (args.document_id, args.entry_date),
+    ).fetchone()
+    if not entry:
+        db.close()
+        output_json({'cached': False})
+        log_entry(cmd_str, 'ALLOWED', 0)
+        return
+    entry_id = db.execute(
+        'SELECT id FROM entries WHERE document_id = ? AND entry_date = ?',
+        (args.document_id, args.entry_date),
+    ).fetchone()['id']
+    sections = db.execute(
+        'SELECT id, section_type, heading_text, start_index, end_index '
+        'FROM sections WHERE entry_id = ? ORDER BY start_index',
+        (entry_id,),
+    ).fetchall()
+    subsections = []
+    for sec in sections:
+        subs = db.execute(
+            'SELECT heading_text, start_index, end_index, sort_order '
+            'FROM subsections WHERE section_id = ? ORDER BY sort_order',
+            (sec['id'],),
+        ).fetchall()
+        subsections.extend([dict(s) for s in subs])
+    section_list = []
+    for sec in sections:
+        section_list.append({
+            'section_type': sec['section_type'],
+            'heading_text': sec['heading_text'],
+            'start_index': sec['start_index'],
+            'end_index': sec['end_index'],
+        })
+    db.close()
+    output_json({
+        'entry': dict(entry),
+        'sections': section_list,
+        'subsections': subsections,
+    })
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_populate(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    try:
+        data = json.loads(args.json)
+    except json.JSONDecodeError as e:
+        print(json.dumps({'error': f'invalid JSON: {e}'}), file=sys.stderr)
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    document_id = data.get('document_id')
+    revision_id = data.get('revision_id')
+    entries = data.get('entries', [])
+    if not document_id or not revision_id:
+        print(json.dumps({'error': 'document_id and revision_id are required'}), file=sys.stderr)
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    db = get_db()
+    # Delete existing entries for this document (cascades to sections/subsections)
+    db.execute('DELETE FROM entries WHERE document_id = ?', (document_id,))
+    # Upsert document row
+    db.execute(
+        'INSERT INTO documents (document_id, revision_id) VALUES (?, ?) '
+        'ON CONFLICT(document_id) DO UPDATE SET revision_id = ?, '
+        "fetched_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+        (document_id, revision_id, revision_id),
+    )
+    # Insert entries, sections, subsections
+    for ent in entries:
+        cursor = db.execute(
+            'INSERT INTO entries (document_id, entry_date, heading_text, start_index, end_index) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (document_id, ent['entry_date'], ent['heading_text'],
+             ent['start_index'], ent['end_index']),
+        )
+        entry_id = cursor.lastrowid
+        for sec in ent.get('sections', []):
+            sec_cursor = db.execute(
+                'INSERT INTO sections (entry_id, section_type, heading_text, start_index, end_index) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (entry_id, sec['section_type'], sec['heading_text'],
+                 sec['start_index'], sec['end_index']),
+            )
+            section_id = sec_cursor.lastrowid
+            for sub in sec.get('subsections', []):
+                db.execute(
+                    'INSERT INTO subsections (section_id, heading_text, start_index, end_index, sort_order) '
+                    'VALUES (?, ?, ?, ?, ?)',
+                    (section_id, sub['heading_text'], sub['start_index'],
+                     sub['end_index'], sub['sort_order']),
+                )
+    db.commit()
+    db.close()
+    output_json({
+        'populated': True,
+        'document_id': document_id,
+        'revision_id': revision_id,
+        'entry_count': len(entries),
+    })
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_invalidate(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    db.execute('DELETE FROM entries WHERE document_id = ?', (args.document_id,))
+    db.execute(
+        'UPDATE documents SET revision_id = ? WHERE document_id = ?',
+        ('', args.document_id),
+    )
+    db.commit()
+    db.close()
+    output_json({'invalidated': True, 'document_id': args.document_id})
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+# --- Argument Parsing ---
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog='daily-log-cache',
+        description='Daily log document structure cache wrapper',
+    )
+    sub = parser.add_subparsers(dest='command')
+
+    check_p = sub.add_parser('check', help='Check cached revision for a document')
+    check_p.add_argument('document_id')
+
+    get_p = sub.add_parser('get', help='Get cached structure for a date entry')
+    get_p.add_argument('document_id')
+    get_p.add_argument('entry_date')
+
+    populate_p = sub.add_parser('populate', help='Replace entire cache for a document')
+    populate_p.add_argument('--json', required=True, dest='json')
+
+    invalidate_p = sub.add_parser('invalidate', help='Invalidate cache for a document')
+    invalidate_p.add_argument('document_id')
+
+    return parser
+
+
+ROUTES = {
+    'check': cmd_check,
+    'get': cmd_get,
+    'populate': cmd_populate,
+    'invalidate': cmd_invalidate,
+}
+
+
+def main():
+    init()
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+    cmd_str = ' '.join(sys.argv)
+    handler = ROUTES[args.command]
+    handler(args, cmd_str)
+
+
+if __name__ == '__main__':
+    main()

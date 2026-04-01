@@ -9,10 +9,11 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 
 - **GWS wrapper:** `/home/timothylytle/agent-team/bin/gws-safe`
 - **Config file:** `/home/timothylytle/agent-team/config/daily_log.json`
-- **In-progress task list ID:** `TG16TWFNTkNRblVkdHdhbQ`
-- **Waiting task list ID:** `ZGRjdFdTV19KWGkxVTdMbg`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
-- **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip)
+- **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip), `inProgressTaskListId` (in-progress task list), `waitingTaskListId` (waiting task list)
+- **Cache wrapper:** `/home/timothylytle/agent-team/bin/daily-log-cache`
+- **FreshDesk wrapper:** `/home/timothylytle/agent-team/bin/freshdesk-safe`
+- **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
 
 ## Command Rules
 
@@ -81,16 +82,27 @@ After fetching events, filter out:
 
 If `excludeEventColorIds` is not set in the config, do not filter by color.
 
-**In-progress tasks:**
+**In-progress tasks:** Use `inProgressTaskListId` and `waitingTaskListId` from the config file read in Step 1.
+
 ```bash
-gws-safe tasks tasks list --params '{"tasklist":"TG16TWFNTkNRblVkdHdhbQ","showAssigned":true}'
+gws-safe tasks tasks list --params '{"tasklist":"<IN_PROGRESS_TASK_LIST_ID>","showAssigned":true}'
 ```
 
 **Waiting tasks:**
 ```bash
-gws-safe tasks tasks list --params '{"tasklist":"ZGRjdFdTV19KWGkxVTdMbg","showAssigned":true}'
+gws-safe tasks tasks list --params '{"tasklist":"<WAITING_TASK_LIST_ID>","showAssigned":true}'
 ```
 After fetching waiting tasks, filter the results to only include tasks where `due` matches today's date (format: `YYYY-MM-DDT00:00:00.000Z`). Tasks with future or past due dates should be excluded from the Waiting / Blockers section.
+
+**Open tickets:**
+```bash
+freshdesk-safe tickets search --query "status:2"
+```
+From the results, extract each ticket's `id`, `subject`, and requester. For each ticket, look up the requester using:
+```bash
+freshdesk-safe contacts view <REQUESTER_ID>
+```
+Use the contact's `name` as the customer name. If the contact lookup fails, use "Unknown" as the customer name.
 
 **Random fact:** Generate a quirky or funny historical fact about today's date from your own knowledge. Keep it to 1-2 sentences.
 
@@ -100,6 +112,7 @@ Compose the full entry as a single text block. The structure is:
 
 ```
 [Today's Date]
+Task List
 🎯 Priorities:
 (event) [event title] [formatted time]
 (event) [next event] [formatted time]
@@ -110,6 +123,9 @@ Compose the full entry as a single text block. The structure is:
 [or "None" if no waiting tasks are due today]
 🎲 Random Fact:
 [Your generated fact about today's date]
+Open Tickets:
+[<ticket-id>] customer - subject - https://miarec.freshdesk.com/a/tickets/<ticket-id>
+[or "None" if no open tickets]
 Thoughts / Ideas:
 
 Notes
@@ -128,10 +144,12 @@ Build a `batchUpdate` request that inserts the entry at the TOP of the document 
 1. **Insert all text first** at index 1 as a single `insertText` request. Include newlines to separate each line. Add a trailing newline at the end.
 
 2. **Apply formatting** with subsequent requests. After the text is inserted, calculate the character indices and apply:
+   - `updateParagraphStyle` for NORMAL_TEXT on all remaining paragraphs (section labels, bullet items, random fact text, empty lines). This is required because inserted text inherits the style of the existing paragraph at the insertion point.
    - `updateParagraphStyle` for HEADING_1 on the date line
-   - `updateParagraphStyle` for HEADING_2 on "Thoughts / Ideas:" and "Notes"
+   - `updateParagraphStyle` for HEADING_2 on "Task List", "Open Tickets:", "Thoughts / Ideas:", and "Notes"
    - `updateParagraphStyle` for HEADING_3 on each task/event sub-heading under Notes
    - `createParagraphBullets` on the priority items and waiting/blocker items
+   - `createParagraphBullets` with `bulletPreset: "BULLET_CHECKBOX"` on the open ticket items (instead of the default bullet preset used for priorities/waiting items)
    - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` and `fields: "weightedFontFamily"` on all HEADING_1, HEADING_2, and HEADING_3 paragraphs
    - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs (section labels, random fact text, bullet items)
 
@@ -151,42 +169,23 @@ After the batchUpdate succeeds, re-read the document using `docs documents get` 
 
 If formatting is incorrect, report the discrepancy to the user rather than attempting to fix it automatically.
 
-After successful verification, report what was created: number of events, tasks, and the random fact.
+After successful verification, populate the cache with the full document structure. Parse ALL entries in the document (not just today's) and their sections/subsections:
+```bash
+daily-log-cache populate --json '{"document_id":"<DOC_ID>","revision_id":"<REVISION_ID>","entries":[...]}'
+```
+This ensures the cache is warm for the sub-skill calls in Step 4.
+
+Report what was created: number of events, tasks, and the random fact.
 
 ## Step 4: Update existing entry
 
 If today's entry already exists:
 
-### 4a: Re-fetch current data
+Read and follow `.claude/skills/task-list/SKILL.md`. It will update the Task List section (priorities, waiting/blockers, and Notes sub-headings) with fresh data.
 
-Run the same calendar, in-progress tasks, and waiting tasks commands from Step 3a to get fresh data.
+Then read and follow `.claude/skills/open-tickets/SKILL.md`. It will update the Open Tickets section with current FreshDesk ticket data.
 
-### 4b: Compare and identify changes
-
-Read the current doc content. Find today's entry: it starts at today's HEADING_1 paragraph. The end of today's entry is the `startIndex` of the next HEADING_1 paragraph, or if no next HEADING_1 exists, the `endIndex` of the last element in `body.content`. Identify:
-
-- New calendar events not already listed in Priorities
-- New tasks not already listed in Priorities
-- Tasks that have been completed (in the doc but no longer in the in-progress list)
-- Changes to the waiting/blockers list
-- New events/tasks that need HEADING_3 sub-sections under Notes
-
-### 4c: Apply updates via batchUpdate
-
-Build a batchUpdate request that:
-
-- Adds new priority items to the Priorities bullet list
-- Updates the Waiting / Blockers section with current data
-- Adds new HEADING_3 sub-sections at the end of the Notes section for any new tasks/events
-
-**Do NOT overwrite or modify:**
-- Any text the user has typed under existing HEADING_3 sections
-- The Thoughts / Ideas section content
-- The Random Fact section
-
-Execute the batchUpdate with dry-run and confirmation flow.
-
-Report what was updated.
+Report what each sub-skill updated.
 
 ## Step 5: Archive old entries
 
@@ -325,6 +324,21 @@ gws-safe docs documents batchUpdate --json '{"requests":[{"deleteContentRange":{
 ```
 
 **If no old entries exist:** Skip this step silently.
+
+### 5f: Invalidate and repopulate cache
+
+If entries were deleted from the main doc in Step 5e, the cached indices are now stale. Invalidate the cache:
+```bash
+daily-log-cache invalidate <DOC_ID>
+```
+Then re-read the document and populate fresh:
+```bash
+gws-safe docs documents get --params '{"documentId":"<DOC_ID>"}'
+```
+Parse the full document structure (all remaining entries and their sections/subsections) and run:
+```bash
+daily-log-cache populate --json '{"document_id":"<DOC_ID>","revision_id":"<REVISION_ID>","entries":[...]}'
+```
 
 ## Error Handling
 

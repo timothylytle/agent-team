@@ -11,6 +11,8 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 - **Config file:** `/home/timothylytle/agent-team/config/daily_log.json`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
 - **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip), `inProgressTaskListId` (in-progress task list), `waitingTaskListId` (waiting task list)
+- **FreshDesk wrapper:** `/home/timothylytle/agent-team/bin/freshdesk-safe`
+- **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
 
 ## Command Rules
 
@@ -91,6 +93,16 @@ gws-safe tasks tasks list --params '{"tasklist":"<WAITING_TASK_LIST_ID>","showAs
 ```
 After fetching waiting tasks, filter the results to only include tasks where `due` matches today's date (format: `YYYY-MM-DDT00:00:00.000Z`). Tasks with future or past due dates should be excluded from the Waiting / Blockers section.
 
+**Open tickets:**
+```bash
+freshdesk-safe tickets search --query "status:2"
+```
+From the results, extract each ticket's `id`, `subject`, and requester. For each ticket, look up the requester using:
+```bash
+freshdesk-safe contacts view <REQUESTER_ID>
+```
+Use the contact's `name` as the customer name. If the contact lookup fails, use "Unknown" as the customer name.
+
 **Random fact:** Generate a quirky or funny historical fact about today's date from your own knowledge. Keep it to 1-2 sentences.
 
 ### 3b: Build the entry text
@@ -99,6 +111,7 @@ Compose the full entry as a single text block. The structure is:
 
 ```
 [Today's Date]
+Task List
 🎯 Priorities:
 (event) [event title] [formatted time]
 (event) [next event] [formatted time]
@@ -109,6 +122,9 @@ Compose the full entry as a single text block. The structure is:
 [or "None" if no waiting tasks are due today]
 🎲 Random Fact:
 [Your generated fact about today's date]
+Open Tickets:
+[<ticket-id>] customer - subject - https://miarec.freshdesk.com/a/tickets/<ticket-id>
+[or "None" if no open tickets]
 Thoughts / Ideas:
 
 Notes
@@ -127,10 +143,12 @@ Build a `batchUpdate` request that inserts the entry at the TOP of the document 
 1. **Insert all text first** at index 1 as a single `insertText` request. Include newlines to separate each line. Add a trailing newline at the end.
 
 2. **Apply formatting** with subsequent requests. After the text is inserted, calculate the character indices and apply:
+   - `updateParagraphStyle` for NORMAL_TEXT on all remaining paragraphs (section labels, bullet items, random fact text, empty lines). This is required because inserted text inherits the style of the existing paragraph at the insertion point.
    - `updateParagraphStyle` for HEADING_1 on the date line
-   - `updateParagraphStyle` for HEADING_2 on "Thoughts / Ideas:" and "Notes"
+   - `updateParagraphStyle` for HEADING_2 on "Task List", "Open Tickets:", "Thoughts / Ideas:", and "Notes"
    - `updateParagraphStyle` for HEADING_3 on each task/event sub-heading under Notes
    - `createParagraphBullets` on the priority items and waiting/blocker items
+   - `createParagraphBullets` with `bulletPreset: "BULLET_CHECKBOX"` on the open ticket items (instead of the default bullet preset used for priorities/waiting items)
    - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` and `fields: "weightedFontFamily"` on all HEADING_1, HEADING_2, and HEADING_3 paragraphs
    - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs (section labels, random fact text, bullet items)
 
@@ -158,7 +176,7 @@ If today's entry already exists:
 
 ### 4a: Re-fetch current data
 
-Run the same calendar, in-progress tasks, and waiting tasks commands from Step 3a to get fresh data.
+Run the same calendar, in-progress tasks, waiting tasks, and open tickets commands from Step 3a to get fresh data.
 
 ### 4b: Compare and identify changes
 
@@ -168,6 +186,8 @@ Read the current doc content. Find today's entry: it starts at today's HEADING_1
 - New tasks not already listed in Priorities
 - Tasks that have been completed (in the doc but no longer in the in-progress list)
 - Changes to the waiting/blockers list
+- New open tickets not already listed in Open Tickets
+- Tickets that are no longer open (closed since last update)
 - New events/tasks that need HEADING_3 sub-sections under Notes
 
 ### 4c: Apply updates via batchUpdate
@@ -176,6 +196,7 @@ Build a batchUpdate request that:
 
 - Adds new priority items to the Priorities bullet list
 - Updates the Waiting / Blockers section with current data
+- Updates the Open Tickets section with current data
 - Adds new HEADING_3 sub-sections at the end of the Notes section for any new tasks/events
 
 **Do NOT overwrite or modify:**

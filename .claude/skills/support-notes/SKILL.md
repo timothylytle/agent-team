@@ -11,6 +11,7 @@ You are executing the Support Notes skill. Follow these steps in order. Be funct
 - **FreshDesk wrapper:** `/home/timothylytle/agent-team/bin/freshdesk-safe`
 - **CRM wrapper:** `/home/timothylytle/agent-team/bin/crm-safe`
 - **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
+- **Style config:** `/home/timothylytle/agent-team/config/doc_styles.json`
 - **Shared Drive name:** `Customers`
 
 ## Command Rules
@@ -46,6 +47,10 @@ This skill may ONLY use the following operations:
 - `crm-safe companies create` (write)
 - `crm-safe files create` (write)
 - `crm-safe files link` (write)
+
+## Step 0: Read style config
+
+Read the style config at `/home/timothylytle/agent-team/config/doc_styles.json`. Use these values for all document formatting.
 
 ## Step 1: Gather non-closed tickets
 
@@ -211,6 +216,10 @@ Build the batchUpdate:
 2. **Apply formatting** with subsequent requests. After text is inserted, calculate character indices and apply:
    - `updateParagraphStyle` for HEADING_1 on the ticket subject line
    - `updateParagraphStyle` for HEADING_2 on the "Key Facts" line
+   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on all HEADING_1 and HEADING_2 paragraphs
+   - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs
+   - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
    - `updateTextStyle` with `link.url` set to `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>` on the "FreshDesk Ticket" text
 
 Execute:
@@ -291,63 +300,79 @@ Use a Python heredoc script to parse the note's `body` HTML. The script should:
 Example:
 ```bash
 python3 << 'PYEOF'
-import json, re, sys
+import json, re
 
 html = '''<NOTE_BODY_HTML>'''
 
 # Remove support-bot mention
 html = re.sub(r'@?support[- ]bot', '', html, flags=re.IGNORECASE)
 
-# Track links and images before stripping tags
-links = []
-images = []
-
-# Replace <br>, </p>, </div> with newline markers
+# Replace block-level closing tags with newlines
 html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
 html = re.sub(r'</p>', '\n', html, flags=re.IGNORECASE)
 html = re.sub(r'</div>', '\n', html, flags=re.IGNORECASE)
 
-# Extract links with positions
-text_so_far = ''
-result_text = ''
-pos = 0
-link_pattern = re.compile(r'<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-img_pattern = re.compile(r'<img\s+[^>]*src=["\']([^"\']*)["\'][^>]*/?>', re.IGNORECASE)
+IMG_PLACEHOLDER = '\uFFFC'
 
-# Process HTML sequentially: find all tags and text
 tag_re = re.compile(r'(<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>|<img\s+[^>]*src=["\']([^"\']*)["\'][^>]*/?>|<[^>]+>)', re.IGNORECASE | re.DOTALL)
+size_re = re.compile(r'(?:width=["\'](\d+)["\']|height=["\'](\d+)["\'])', re.IGNORECASE)
 
 clean_pos = 0
 clean_text = ''
-link_list = []
-image_list = []
+raw_links = []  # (display_text, url)
+raw_images = []  # (url, width, height) — ordered by appearance
 
 for m in tag_re.finditer(html):
-    # Add text before this tag
-    before = html[clean_pos:m.start()]
-    clean_text += before
-
+    clean_text += html[clean_pos:m.start()]
     if m.group(3) is not None:  # <a> tag
         link_text = re.sub(r'<[^>]+>', '', m.group(3))
-        start = len(clean_text)
+        raw_links.append((link_text, m.group(2)))
         clean_text += link_text
-        end = len(clean_text)
-        link_list.append({"start": start, "end": end, "url": m.group(2)})
     elif m.group(4) is not None:  # <img> tag
-        offset = len(clean_text)
-        image_list.append({"offset": offset, "url": m.group(4)})
-    # else: other tag, skip
-
+        # Extract optional width/height
+        tag_str = m.group(0)
+        sizes = size_re.findall(tag_str)
+        w, h = None, None
+        for sw, sh in sizes:
+            if sw: w = int(sw)
+            if sh: h = int(sh)
+        raw_images.append((m.group(4), w, h))
+        clean_text += IMG_PLACEHOLDER
     clean_pos = m.end()
 
-# Add remaining text
 clean_text += html[clean_pos:]
 
-# Collapse excessive blank lines
+# Apply newline collapsing and stripping
 clean_text = re.sub(r'\n{3,}', '\n\n', clean_text)
 clean_text = clean_text.strip()
 
-print(json.dumps({"text": clean_text, "links": link_list, "images": image_list}))
+# Now find image positions in the final text
+image_positions = []
+for i, ch in enumerate(clean_text):
+    if ch == IMG_PLACEHOLDER:
+        image_positions.append(i)
+
+# Remove placeholders and build final text
+final_text = clean_text.replace(IMG_PLACEHOLDER, '')
+
+# Calculate image offsets in the final text (adjust for removed placeholders)
+images = []
+for idx, pos in enumerate(image_positions):
+    adjusted_pos = pos - idx  # subtract count of placeholders before this one
+    url, w, h = raw_images[idx]
+    img_record = {"offset": adjusted_pos, "url": url}
+    if w is not None: img_record["width"] = w
+    if h is not None: img_record["height"] = h
+    images.append(img_record)
+
+# Find link positions in the final text
+links = []
+for display_text, url in raw_links:
+    idx = final_text.find(display_text)
+    if idx >= 0:
+        links.append({"start": idx, "end": idx + len(display_text), "url": url})
+
+print(json.dumps({"text": final_text, "links": links, "images": images}))
 PYEOF
 ```
 
@@ -374,10 +399,17 @@ Build batchUpdate requests:
 1. `insertText` at the insertion point with all the section text
 2. `updateParagraphStyle` for NORMAL_TEXT on the entire inserted range (to reset any inherited style)
 3. `updateParagraphStyle` for HEADING_2 on the heading line (`YYYYMMDD-ticket-note`)
-4. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` and `fields: "weightedFontFamily"` on the heading line
-5. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` and `fields: "weightedFontFamily"` on normal text paragraphs (metadata lines and content)
+4. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on the heading line
+   - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+5. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on normal text paragraphs (metadata lines and content)
+   - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 6. `updateTextStyle` with `link.url` for each extracted link — calculate start/end indices relative to the insertion point by adding the link's offset within the content text to the absolute index where the content text begins
-7. `insertInlineImage` for each image — process highest-index-first to avoid index shifting. If image insertion fails, note it in the report but still insert text and links.
+7. `insertInlineImage` for each image in the `images` array from Step 9e-vi:
+   - Calculate the absolute insertion index: `content_start + image["offset"]`, where `content_start` is the absolute index where the note's content text begins in the document (after the heading, created, author, and blank lines)
+   - If the image record includes `width` and `height`, include `objectSize: {"height": {"magnitude": <height>, "unit": "PT"}, "width": {"magnitude": <width>, "unit": "PT"}}` in the request
+   - Sort all `insertInlineImage` requests by index highest-to-lowest
+   - Place them AFTER all text, styling, and link requests in the batchUpdate array
+   - If image insertion fails, retry the batchUpdate without the failing `insertInlineImage` requests. Report skipped images to the user.
 
 Execute:
 ```bash

@@ -12,6 +12,7 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
 - **Config fields:** `documentId` (daily log doc), `archiveDocumentId` (archive doc), `excludeEventColorIds` (array of colorId strings to skip), `inProgressTaskListId` (in-progress task list), `waitingTaskListId` (waiting task list)
 - **Cache wrapper:** `/home/timothylytle/agent-team/bin/daily-log-cache`
+- **Style config:** `/home/timothylytle/agent-team/config/doc_styles.json`
 - **FreshDesk wrapper:** `/home/timothylytle/agent-team/bin/freshdesk-safe`
 - **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
 
@@ -24,6 +25,8 @@ You are executing the Daily Log skill. Follow these steps in order. Be functiona
 ## Step 1: Ensure the daily log doc exists
 
 Read the config file at `/home/timothylytle/agent-team/config/daily_log.json`.
+
+Read the style config at `/home/timothylytle/agent-team/config/doc_styles.json`. Use these values for all document formatting.
 
 **If the config file does not exist or has no `documentId`:**
 
@@ -149,9 +152,11 @@ Build a `batchUpdate` request that inserts the entry at the TOP of the document 
    - `updateParagraphStyle` for HEADING_2 on "Task List", "Open Tickets:", "Thoughts / Ideas:", and "Notes"
    - `updateParagraphStyle` for HEADING_3 on each task/event sub-heading under Notes
    - `createParagraphBullets` on the priority items and waiting/blocker items
-   - `createParagraphBullets` with `bulletPreset: "BULLET_CHECKBOX"` on the open ticket items (instead of the default bullet preset used for priorities/waiting items)
-   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` and `fields: "weightedFontFamily"` on all HEADING_1, HEADING_2, and HEADING_3 paragraphs
-   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs (section labels, random fact text, bullet items)
+   - `createParagraphBullets` with `bulletPreset: "<bulletPresets.checkbox from style config>"` on the open ticket items (instead of the default bullet preset used for priorities/waiting items)
+   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on all HEADING_1, HEADING_2, and HEADING_3 paragraphs
+   - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs (section labels, random fact text, bullet items)
+   - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 
 **Index calculation:** After inserting text at index 1, count characters from index 1 to determine the start and end index of each line. Remember that each newline character (`\n`) counts as 1 character.
 
@@ -275,7 +280,7 @@ Group entries by target week tab. For each week tab, build requests to insert at
 
 1. **`insertText`** at `{"tabId": "<WEEK_TAB_ID>", "index": 1}` — insert entries newest-first within each week so they appear newest-to-oldest
 2. **`updateParagraphStyle`** for heading paragraphs (HEADING_1 for date lines, HEADING_2 for section labels, HEADING_3 for note sub-sections)
-3. **`updateTextStyle`** with `weightedFontFamily: {"fontFamily": "Lexend"}` on all heading paragraphs, and `{"fontFamily": "Roboto"}` on all NORMAL_TEXT paragraphs
+3. **`updateTextStyle`** with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` on all heading paragraphs, and `{"fontFamily": "<fonts.body from style config>"}` on all NORMAL_TEXT paragraphs. If `colors.headingText` in the style config is not null, include `foregroundColor` on heading text. If `colors.bodyText` is not null, include `foregroundColor` on body text.
 4. **`createParagraphBullets`** for bulleted paragraphs
 5. **`updateTextStyle`** with a hyperlink for each `richLink` element. After text insertion, add an `updateTextStyle` request to apply the link:
    ```json

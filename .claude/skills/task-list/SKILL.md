@@ -23,6 +23,7 @@ Report what was updated: number of events added/removed, tasks added/removed, wa
 - **Config file:** `/home/timothylytle/agent-team/config/daily_log.json`
 - **Config fields used:** `documentId`, `inProgressTaskListId`, `waitingTaskListId`, `excludeEventColorIds`
 - **Cache wrapper:** `/home/timothylytle/agent-team/bin/daily-log-cache`
+- **Style config:** `/home/timothylytle/agent-team/config/doc_styles.json`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
 
 ## Command Rules
@@ -46,6 +47,8 @@ Report what was updated: number of events added/removed, tasks added/removed, wa
 ## Step 1: Read config
 
 Read the config file to get `documentId`, `inProgressTaskListId`, `waitingTaskListId`, and `excludeEventColorIds`.
+
+Read the style config at `/home/timothylytle/agent-team/config/doc_styles.json`. Use these values for all document formatting.
 
 ## Step 2: Check cache
 
@@ -123,8 +126,10 @@ Build a batchUpdate request that:
 - Adds new priority items to the Priorities bullet list (format: `(event) title time` or `(task) title`)
 - Updates the Waiting / Blockers content with current data
 - Adds new HEADING_3 sub-sections at the end of the Notes section for any new tasks/events
-- Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` on new HEADING_3 paragraphs
-- Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` on new NORMAL_TEXT paragraphs
+- Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on new HEADING_3 paragraphs
+- If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+- Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on new NORMAL_TEXT paragraphs
+- If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 - Apply `createParagraphBullets` on new bullet items
 
 For event times, format as `h:mm AM/PM` (e.g., `9:00 AM`). For all-day events, use `all day`.

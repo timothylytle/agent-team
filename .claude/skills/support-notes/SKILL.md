@@ -11,6 +11,7 @@ You are executing the Support Notes skill. Follow these steps in order. Be funct
 - **FreshDesk wrapper:** `/home/timothylytle/agent-team/bin/freshdesk-safe`
 - **CRM wrapper:** `/home/timothylytle/agent-team/bin/crm-safe`
 - **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
+- **Style config:** `/home/timothylytle/agent-team/config/doc_styles.json`
 - **Shared Drive name:** `Customers`
 
 ## Command Rules
@@ -46,6 +47,10 @@ This skill may ONLY use the following operations:
 - `crm-safe companies create` (write)
 - `crm-safe files create` (write)
 - `crm-safe files link` (write)
+
+## Step 0: Read style config
+
+Read the style config at `/home/timothylytle/agent-team/config/doc_styles.json`. Use these values for all document formatting.
 
 ## Step 1: Gather non-closed tickets
 
@@ -211,6 +216,10 @@ Build the batchUpdate:
 2. **Apply formatting** with subsequent requests. After text is inserted, calculate character indices and apply:
    - `updateParagraphStyle` for HEADING_1 on the ticket subject line
    - `updateParagraphStyle` for HEADING_2 on the "Key Facts" line
+   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on all HEADING_1 and HEADING_2 paragraphs
+   - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+   - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs
+   - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
    - `updateTextStyle` with `link.url` set to `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>` on the "FreshDesk Ticket" text
 
 Execute:
@@ -374,8 +383,10 @@ Build batchUpdate requests:
 1. `insertText` at the insertion point with all the section text
 2. `updateParagraphStyle` for NORMAL_TEXT on the entire inserted range (to reset any inherited style)
 3. `updateParagraphStyle` for HEADING_2 on the heading line (`YYYYMMDD-ticket-note`)
-4. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` and `fields: "weightedFontFamily"` on the heading line
-5. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` and `fields: "weightedFontFamily"` on normal text paragraphs (metadata lines and content)
+4. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on the heading line
+   - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+5. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on normal text paragraphs (metadata lines and content)
+   - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 6. `updateTextStyle` with `link.url` for each extracted link — calculate start/end indices relative to the insertion point by adding the link's offset within the content text to the absolute index where the content text begins
 7. `insertInlineImage` for each image — process highest-index-first to avoid index shifting. If image insertion fails, note it in the report but still insert text and links.
 

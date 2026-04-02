@@ -1,0 +1,15 @@
+{
+  "fonts": {
+    "heading": "Lexend",
+    "body": "Roboto"
+  },
+  "colors": {
+    "headingText": null,
+    "bodyText": null,
+    "background": null
+  },
+  "bulletPresets": {
+    "default": "BULLET_DISC_CIRCLE_SQUARE",
+    "checkbox": "BULLET_CHECKBOX"
+  }
+}

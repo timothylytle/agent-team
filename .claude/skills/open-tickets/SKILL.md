@@ -25,6 +25,7 @@ Report what was updated: number of tickets added/removed.
 - **Config fields used:** `documentId`
 - **FreshDesk ticket URL pattern:** `https://miarec.freshdesk.com/a/tickets/<TICKET_ID>`
 - **Cache wrapper:** `/home/timothylytle/agent-team/bin/daily-log-cache`
+- **Style config:** `/home/timothylytle/agent-team/config/doc_styles.json`
 - **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
 
 ## Command Rules
@@ -47,6 +48,8 @@ Report what was updated: number of tickets added/removed.
 ## Step 1: Read config
 
 Read the config file to get `documentId`.
+
+Read the style config at `/home/timothylytle/agent-team/config/doc_styles.json`. Use these values for all document formatting.
 
 ## Step 2: Check cache
 
@@ -107,8 +110,9 @@ If there are new tickets to add, build a batchUpdate request that appends them t
 
 1. Insert new ticket lines at the end of the existing Open Tickets content (just before the next HEADING_2 paragraph). The insert index is the `startIndex` of the next HEADING_2 after "Open Tickets:" (i.e., the section `end_index` from the cache or parsed structure).
 2. Format each new ticket as: `[<ticket-id>] customer - subject - https://miarec.freshdesk.com/a/tickets/<ticket-id>` followed by a newline
-3. Apply `createParagraphBullets` with `bulletPreset: "BULLET_CHECKBOX"` on the new ticket items
-4. Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` on the new ticket items
+3. Apply `createParagraphBullets` with `bulletPreset: "<bulletPresets.checkbox from style config>"` on the new ticket items
+4. Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` on the new ticket items
+   - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 
 Execute the batchUpdate:
 ```bash

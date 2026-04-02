@@ -34,10 +34,12 @@ This skill may ONLY use the following operations:
 - `gws-safe drive drives list` (read)
 - `gws-safe drive files list` (read)
 - `gws-safe drive files create` (write, dry-run enforced)
+- `gws-safe docs documents get` (read)
 - `gws-safe docs documents batchUpdate` (write, dry-run enforced)
 
 ### FreshDesk
 - `freshdesk-safe contacts view` (read)
+- `freshdesk-safe tickets view` (read)
 - `freshdesk-safe tickets note` (write, dry-run enforced)
 
 ### CRM
@@ -59,9 +61,12 @@ For each ticket from Step 1, read and follow `.claude/skills/freshdesk-notes/SKI
 - ticket_id: the FreshDesk ticket ID
 - search_pattern: `docs.google.com/document`
 
-If `found` is true, that ticket already has a support notes doc. Skip it.
+Separate the tickets into two lists:
 
-Collect the remaining tickets that need support notes. If none remain, report "All assigned tickets already have support notes" and stop.
+- **Tickets without docs** (`found` is false): these need new support notes and proceed through Steps 3-9.
+- **Tickets with existing docs** (`found` is true): extract the Google Doc URL from the matching note's `body` field. Parse the Google Doc ID from the URL — the segment after `/document/d/` and before the next `/`. Collect these tickets with their doc IDs for processing in Step 9e.
+
+If no tickets need new docs AND no tickets have existing docs, report "No assigned non-closed tickets found" and stop. If no tickets need new docs but some have existing docs, skip to Step 9e.
 
 ## Step 3: Look up requestor details
 
@@ -238,13 +243,162 @@ Extract the `id` from the response to use as `FILE_ID` below.
 crm-safe files link --company-id COMPANY_ID --file-id FILE_ID
 ```
 
+### 9e: Inject support-bot tagged notes
+
+For ALL tickets that have a support doc — both newly created in Step 9 and pre-existing from Step 2 — perform the following. For newly created tickets, the doc ID comes from the Step 9a response. For pre-existing tickets, the doc ID was parsed from the note body in Step 2.
+
+#### 9e-i: Fetch conversations
+
+```bash
+freshdesk-safe tickets view <TICKET_ID> --include conversations
+```
+
+#### 9e-ii: Find tagged notes
+
+Filter conversations where:
+- `private` is true (or `source` is 2)
+- `body_text` contains "support-bot" (case-insensitive)
+
+If no tagged notes are found for this ticket, skip to the next ticket.
+
+#### 9e-iii: Read the support doc
+
+```bash
+gws-safe docs documents get --params '{"documentId":"<DOC_ID>"}'
+```
+
+#### 9e-iv: Duplicate detection
+
+For each matching note, check if it has already been injected. Parse the note's `created_at` field (e.g., `"2026-04-02T14:30:00Z"`) and format it as `YYYY-MM-DD HH:MM:SS (UTC)`. Search through the doc's text content for this exact string. If found, skip this note.
+
+#### 9e-v: Resolve author
+
+Look up the note's `user_id`:
+```bash
+freshdesk-safe contacts view <USER_ID>
+```
+Use the `name` field. If the lookup fails, use "Unknown".
+
+#### 9e-vi: Extract content from HTML
+
+Use a Python heredoc script to parse the note's `body` HTML. The script should:
+- Strip/remove the "support-bot" mention text (and any "@" prefix)
+- Extract plain text: strip HTML tags, convert `<br>`, `</p>`, `</div>` to newlines, collapse excessive blank lines (3+ consecutive newlines become 2)
+- Track links: for each `<a href="URL">text</a>`, record the text, URL, and character offset within the extracted text
+- Track inline images: for each `<img src="URL">`, record the URL and character offset
+- Output as JSON: `{"text": "...", "links": [{"start": N, "end": N, "url": "..."}], "images": [{"offset": N, "url": "..."}]}`
+
+Example:
+```bash
+python3 << 'PYEOF'
+import json, re, sys
+
+html = '''<NOTE_BODY_HTML>'''
+
+# Remove support-bot mention
+html = re.sub(r'@?support-bot', '', html, flags=re.IGNORECASE)
+
+# Track links and images before stripping tags
+links = []
+images = []
+
+# Replace <br>, </p>, </div> with newline markers
+html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+html = re.sub(r'</p>', '\n', html, flags=re.IGNORECASE)
+html = re.sub(r'</div>', '\n', html, flags=re.IGNORECASE)
+
+# Extract links with positions
+text_so_far = ''
+result_text = ''
+pos = 0
+link_pattern = re.compile(r'<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+img_pattern = re.compile(r'<img\s+[^>]*src=["\']([^"\']*)["\'][^>]*/?>', re.IGNORECASE)
+
+# Process HTML sequentially: find all tags and text
+tag_re = re.compile(r'(<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>|<img\s+[^>]*src=["\']([^"\']*)["\'][^>]*/?>|<[^>]+>)', re.IGNORECASE | re.DOTALL)
+
+clean_pos = 0
+clean_text = ''
+link_list = []
+image_list = []
+
+for m in tag_re.finditer(html):
+    # Add text before this tag
+    before = html[clean_pos:m.start()]
+    clean_text += before
+
+    if m.group(3) is not None:  # <a> tag
+        link_text = re.sub(r'<[^>]+>', '', m.group(3))
+        start = len(clean_text)
+        clean_text += link_text
+        end = len(clean_text)
+        link_list.append({"start": start, "end": end, "url": m.group(2)})
+    elif m.group(4) is not None:  # <img> tag
+        offset = len(clean_text)
+        image_list.append({"offset": offset, "url": m.group(4)})
+    # else: other tag, skip
+
+    clean_pos = m.end()
+
+# Add remaining text
+clean_text += html[clean_pos:]
+
+# Collapse excessive blank lines
+clean_text = re.sub(r'\n{3,}', '\n\n', clean_text)
+clean_text = clean_text.strip()
+
+print(json.dumps({"text": clean_text, "links": link_list, "images": image_list}))
+PYEOF
+```
+
+Replace `<NOTE_BODY_HTML>` with the note's `body` field value (escape single quotes as needed for the heredoc).
+
+#### 9e-vii: Build and execute batchUpdate
+
+Build the section text for each note:
+```
+YYYYMMDD-ticket-note\n
+Created: YYYY-MM-DD HH:MM:SS (UTC)\n
+Author: [Name]\n
+\n
+[Extracted content text]\n
+```
+
+Where `YYYYMMDD` comes from the note's `created_at` date.
+
+Find the insertion point: from the doc read in Step 9e-iii, take the last element's `endIndex` in `body.content` and insert at `endIndex - 1` (before the trailing newline).
+
+**Index calculation:** After inserting text at the insertion point, count characters from that point to determine the start and end index of each line. Each newline character (`\n`) counts as 1 character. Calculate all formatting ranges relative to the insertion point.
+
+Build batchUpdate requests:
+1. `insertText` at the insertion point with all the section text
+2. `updateParagraphStyle` for NORMAL_TEXT on the entire inserted range (to reset any inherited style)
+3. `updateParagraphStyle` for HEADING_2 on the heading line (`YYYYMMDD-ticket-note`)
+4. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Lexend"}` and `fields: "weightedFontFamily"` on the heading line
+5. `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto"}` and `fields: "weightedFontFamily"` on normal text paragraphs (metadata lines and content)
+6. `updateTextStyle` with `link.url` for each extracted link — calculate start/end indices relative to the insertion point by adding the link's offset within the content text to the absolute index where the content text begins
+7. `insertInlineImage` for each image — process highest-index-first to avoid index shifting. If image insertion fails, note it in the report but still insert text and links.
+
+Execute:
+```bash
+gws-safe docs documents batchUpdate --json '{"requests":[...]}' --params '{"documentId":"<DOC_ID>"}'
+```
+This is a write operation. Present the dry-run to the user, get confirmation, then execute with `--confirmed <nonce>`.
+
+If the batchUpdate fails due to an image insertion error, retry without the `insertInlineImage` requests so that text, formatting, and links are still injected. Report the skipped images to the user.
+
+**Multiple notes per ticket:** If there are additional notes to process for the same ticket, re-read the document (repeat Step 9e-iii) before processing the next note to get the updated endIndex.
+
 ## Step 10: Report results
 
 After all tickets have been processed, report:
 
 - Number of support notes created
 - For each: ticket ID, subject, company, and link to the created Google Doc
-- Any tickets that were skipped (already had notes, or no CRM match)
+- Number of tagged notes injected per ticket
+- For each injected note: ticket ID, note date, and author
+- Any tickets that were skipped (no CRM match or user declined)
+- Any images that failed to insert
 - Any errors encountered
 
 ## Error Handling

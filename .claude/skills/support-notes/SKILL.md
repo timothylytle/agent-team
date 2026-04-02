@@ -257,7 +257,7 @@ freshdesk-safe tickets view <TICKET_ID> --include conversations
 
 Filter conversations where:
 - `private` is true (or `source` is 2)
-- `body_text` contains "support-bot" (case-insensitive)
+- `body_text` contains "support-bot" or "support bot" (case-insensitive)
 
 If no tagged notes are found for this ticket, skip to the next ticket.
 
@@ -296,7 +296,7 @@ import json, re, sys
 html = '''<NOTE_BODY_HTML>'''
 
 # Remove support-bot mention
-html = re.sub(r'@?support-bot', '', html, flags=re.IGNORECASE)
+html = re.sub(r'@?support[- ]bot', '', html, flags=re.IGNORECASE)
 
 # Track links and images before stripping tags
 links = []

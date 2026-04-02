@@ -98,10 +98,13 @@ gws-safe calendar events list --params '{"calendarId":"primary","timeMin":"<TODA
 ```
 Filter out events with `eventType` of `workingLocation` and events whose `colorId` matches any value in `excludeEventColorIds` from the config.
 
+Also capture `description` and `htmlLink` from each event.
+
 **In-progress tasks:**
 ```bash
 gws-safe tasks tasks list --params '{"tasklist":"<IN_PROGRESS_TASK_LIST_ID>","showAssigned":true}'
 ```
+Also capture `webViewLink` from each task.
 
 **Waiting tasks:**
 ```bash
@@ -119,6 +122,11 @@ Compare the fetched data with the current doc content in the Task List section. 
 - Changes to the Waiting / Blockers list
 - New events/tasks that need HEADING_3 sub-sections under Notes (existing HEADING_3 titles must be read from the live document content within the Notes section boundaries, not from the cache)
 
+When determining new HEADING_3 entries to add under Notes:
+1. For each new event: extract the support doc URL from `description` if present using regex `Support Doc:\s*(https://docs\.google\.com/document/d/[^\s]+)`. The link URL is the support doc URL if found, otherwise the event's `htmlLink`.
+2. For each new task: the link URL is the task's `webViewLink` (if available).
+3. Sort the new entries: all-day events first (alphabetically by title), then timed events (by `start.dateTime` ascending), then tasks (in their original list order).
+
 ## Step 6: Apply updates via batchUpdate
 
 Build a batchUpdate request that:
@@ -131,6 +139,7 @@ Build a batchUpdate request that:
 - Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on new NORMAL_TEXT paragraphs
 - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 - Apply `createParagraphBullets` on new bullet items
+- For each new HEADING_3 that has a link URL, apply `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on the heading text range (from heading start index to heading end index minus 1, excluding the trailing newline). Place these link requests AFTER the paragraph style and font requests.
 
 For event times, format as `h:mm AM/PM` (e.g., `9:00 AM`). For all-day events, use `all day`.
 

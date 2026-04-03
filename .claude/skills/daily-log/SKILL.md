@@ -77,7 +77,7 @@ gws-safe calendar events list --params '{"calendarId":"primary","timeMin":"<TODA
 ```
 Replace `<TODAY>` with today's date in `YYYY-MM-DD` format and `<TZ_OFFSET>` with the result of `date +%:z`.
 
-Extract from each event: `summary` (title) and `start.dateTime` or `start.date` (time).
+Extract from each event: `summary` (title), `start.dateTime` or `start.date` (time), `description`, and `htmlLink`.
 
 After fetching events, filter out:
 - Events with `eventType` of `workingLocation`
@@ -90,6 +90,7 @@ If `excludeEventColorIds` is not set in the config, do not filter by color.
 ```bash
 gws-safe tasks tasks list --params '{"tasklist":"<IN_PROGRESS_TASK_LIST_ID>","showAssigned":true}'
 ```
+Also capture `webViewLink` from each task.
 
 **Waiting tasks:**
 ```bash
@@ -133,12 +134,16 @@ Thoughts / Ideas:
 
 Notes
 [Task/Event 1 title]
+[link URL if available]
 [Task/Event 2 title]
+[link URL if available]
 ```
 
 For event times, format as `h:mm AM/PM` (e.g., `9:00 AM`). For all-day events, use `all day`.
 
-Create one HEADING_3 sub-section under Notes for each calendar event and each in-progress task.
+Create one HEADING_3 sub-section under Notes for each calendar event and each in-progress task. Order the Notes sub-sections as follows: all-day events first (alphabetically by title), then timed events (sorted by start time ascending), then tasks (in their original list order).
+
+For each event, extract the support doc URL from `description` if present using regex `Support Doc:\s*(https://docs\.google\.com/document/d/[^\s]+)`. The link URL for the heading is the support doc URL if found, otherwise the event's `htmlLink`. For tasks, the link URL is the task's `webViewLink` (if available).
 
 ### 3c: Insert via batchUpdate
 
@@ -157,6 +162,7 @@ Build a `batchUpdate` request that inserts the entry at the TOP of the document 
    - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
    - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs (section labels, random fact text, bullet items)
    - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
+   - After the font styling requests, for each Notes HEADING_3 that has a link URL, insert a NORMAL_TEXT line immediately after the heading containing the link URL text, then apply `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on that URL text (excluding the trailing newline). Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` on the link line. For events with a `Support Doc:` URL in their description, use the doc URL. For events without a support doc, use the event's `htmlLink`. For tasks, use the task's `webViewLink` (if available).
 
 **Index calculation:** After inserting text at index 1, count characters from index 1 to determine the start and end index of each line. Remember that each newline character (`\n`) counts as 1 character.
 

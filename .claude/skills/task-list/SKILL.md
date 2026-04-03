@@ -3,175 +3,45 @@ name: task-list
 description: Updates the Task List section of today's daily log entry with current calendar events, in-progress tasks, and waiting/blockers.
 ---
 
-You are executing the Task List sub-skill. Follow these steps in order. Be functional and direct.
+You are executing the Task List sub-skill. This skill delegates to a deterministic Python script.
 
 ## Purpose
 
-Fetch current calendar events, in-progress tasks, and waiting tasks, then update the Task List section of today's daily log entry. Designed to run quickly without doc-existence or archive checks.
+Fetch current calendar events, in-progress tasks, and waiting tasks, then update the Task List section and Notes section of today's daily log entry.
 
-## Inputs
+## Execution
 
-None required. Reads configuration from the config file.
-
-## Outputs
-
-Report what was updated: number of events added/removed, tasks added/removed, waiting items changed.
-
-## Constants
-
-- **GWS wrapper:** `/home/timothylytle/agent-team/bin/gws-safe`
-- **Config file:** `/home/timothylytle/agent-team/config/daily_log.json`
-- **Config fields used:** `documentId`, `inProgressTaskListId`, `waitingTaskListId`, `excludeEventColorIds`
-- **Cache wrapper:** `/home/timothylytle/agent-team/bin/daily-log-cache`
-- **Style config:** `/home/timothylytle/agent-team/config/doc_styles.json`
-- **Date format for headings:** `DayOfWeek Mon DD, YYYY` (e.g., `Friday Mar 27, 2026`) — generate with `date +'%A %b %-d, %Y'`
-
-## Command Rules
-
-- Always pass JSON directly inline to `--json` and `--params` flags. Never use command substitution like `"$(cat /tmp/file.json)"` — pass the JSON string directly.
-- For large JSON payloads, construct the full JSON and pass it as a single inline argument.
-
-## Allowed Operations
-
-- `gws-safe docs documents get` (read)
-- `gws-safe calendar events list` (read)
-- `gws-safe tasks tasks list` (read)
-- `gws-safe docs documents batchUpdate` (write, dry-run enforced)
-- `daily-log-cache get` (read)
-- `daily-log-cache populate` (write)
-
-## Blocked Operations
-
-- Any other write operations (create, delete, trash, update on drive/calendar/tasks)
-
-## Step 1: Read config
-
-Read the config file to get `documentId`, `inProgressTaskListId`, `waitingTaskListId`, and `excludeEventColorIds`.
-
-Read the style config at `/home/timothylytle/agent-team/config/doc_styles.json`. Use these values for all document formatting.
-
-## Step 2: Check cache
-
+Run the update script:
 ```bash
-daily-log-cache get <DOC_ID> <TODAY_DATE>
-```
-Where `<TODAY_DATE>` is today in `YYYY-MM-DD` format.
-
-If the cache returns data (not `{"cached": false}`), extract:
-- The `task_list` section boundaries (`start_index`, `end_index`)
-- The `notes` section start/end boundaries (to know where Notes lives in the doc)
-
-Do NOT use cached subsection data for the Notes section — subsection indices change as the user types notes throughout the day, making cached subsection data stale. You still need to fetch the doc content to read the current Notes HEADING_3 subsections (within the Notes section boundaries) and to compare Task List content. Skip to Step 4 (fetch fresh data).
-
-If the cache misses, proceed to Step 3.
-
-## Step 3: Fetch doc and parse structure
-
-Fetch the document:
-```bash
-gws-safe docs documents get --params '{"documentId":"<DOC_ID>"}'
+/home/timothylytle/agent-team/bin/update-task-list --auto-confirm
 ```
 
-If the read fails, report the error and stop.
+If it exits with code 0, report its output (number of items added, what changed).
 
-Find today's HEADING_1 entry. If not found, report: "No entry for today. Run /daily-log first to create the entry." and stop.
+If it exits with a non-zero code, report the error output.
 
-Identify section boundaries within today's entry (from today's HEADING_1 to the next HEADING_1 or end of doc):
+## What the Script Does
 
-- **Task List section start:** The HEADING_2 paragraph with text "Task List". The content starts on the next paragraph.
-- **Task List section end:** The `startIndex` of the next HEADING_2 paragraph after "Task List" (which should be "Open Tickets:" or "Thoughts / Ideas:").
-- **Notes section:** The HEADING_2 paragraph with text "Notes". Identify existing HEADING_3 sub-sections under Notes.
+1. Reads config files (`daily_log.json`, `doc_styles.json`)
+2. Checks the daily-log-cache for today's Task List and Notes section boundaries
+3. Fetches calendar events for today (with 5-minute local cache)
+4. Fetches in-progress and waiting tasks (with 5-minute local cache)
+5. Filters events (excludes `workingLocation` type and excluded colorIds) and waiting tasks (only today's due date)
+6. Fetches the Google Doc and extracts current Task List and Notes section content
+7. Parses existing priority items, waiting/blockers, and Notes HEADING_3 titles
+8. Computes diffs: new priorities, updated waiting/blockers, new Notes headings
+9. Sorts new entries: all-day events first (alphabetically), timed events (by start time), tasks (list order)
+10. Builds and executes a batchUpdate with formatting (bullets, fonts, heading styles, link lines)
+11. Updates the daily-log-cache after a successful write
 
-Populate the cache with the full document structure:
+## Prerequisites
+
+- Today's daily log entry must already exist (run `/daily-log` first if needed)
+- The daily-log-cache must have today's section boundaries populated
+
+## Manual Override
+
+To run without auto-confirm (dry-run only):
 ```bash
-daily-log-cache populate --json '{"document_id":"<DOC_ID>","revision_id":"<REVISION_ID>","entries":[...]}'
+/home/timothylytle/agent-team/bin/update-task-list
 ```
-Include ALL entries and their sections/subsections from the document, not just today's.
-
-## Step 4: Fetch fresh data
-
-Determine the local timezone offset by running `date +%:z`.
-
-**Calendar events:**
-```bash
-gws-safe calendar events list --params '{"calendarId":"primary","timeMin":"<TODAY>T00:00:00<TZ_OFFSET>","timeMax":"<TODAY>T23:59:59<TZ_OFFSET>","singleEvents":true,"orderBy":"startTime"}'
-```
-Filter out events with `eventType` of `workingLocation` and events whose `colorId` matches any value in `excludeEventColorIds` from the config.
-
-Also capture `description` and `htmlLink` from each event.
-
-**In-progress tasks:**
-```bash
-gws-safe tasks tasks list --params '{"tasklist":"<IN_PROGRESS_TASK_LIST_ID>","showAssigned":true}'
-```
-Also capture `webViewLink` from each task.
-
-**Waiting tasks:**
-```bash
-gws-safe tasks tasks list --params '{"tasklist":"<WAITING_TASK_LIST_ID>","showAssigned":true}'
-```
-Filter to only tasks where `due` matches today's date (format: `YYYY-MM-DDT00:00:00.000Z`).
-
-## Step 5: Compare and build updates
-
-Compare the fetched data with the current doc content in the Task List section. Identify:
-
-- New calendar events not already listed in Priorities
-- New tasks not already listed in Priorities
-- Tasks that have been completed (in the doc but no longer in the task list)
-- Changes to the Waiting / Blockers list
-- New events/tasks that need HEADING_3 sub-sections under Notes (existing HEADING_3 titles must be read from the live document content within the Notes section boundaries, not from the cache)
-
-When determining new HEADING_3 entries to add under Notes:
-1. For each new event: extract the support doc URL from `description` if present using regex `Support Doc:\s*(https://docs\.google\.com/document/d/[^\s]+)`. The link URL is the support doc URL if found, otherwise the event's `htmlLink`.
-2. For each new task: the link URL is the task's `webViewLink` (if available).
-3. Sort the new entries: all-day events first (alphabetically by title), then timed events (by `start.dateTime` ascending), then tasks (in their original list order).
-
-## Step 6: Apply updates via batchUpdate
-
-Build a batchUpdate request that:
-
-- Adds new priority items to the Priorities bullet list (format: `(event) title time` or `(task) title`)
-- Updates the Waiting / Blockers content with current data
-- Adds new HEADING_3 sub-sections at the end of the Notes section for any new tasks/events
-- Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.heading from style config>"}` and `fields: "weightedFontFamily"` on new HEADING_3 paragraphs
-- If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
-- Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on new NORMAL_TEXT paragraphs
-- If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
-- Apply `createParagraphBullets` on new bullet items
-- For each new HEADING_3 that has a link URL, insert a NORMAL_TEXT line immediately after the heading containing the link URL text, then apply `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on that URL text (excluding the trailing newline). Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` on the link line. Place these link requests AFTER the paragraph style and font requests.
-
-For event times, format as `h:mm AM/PM` (e.g., `9:00 AM`). For all-day events, use `all day`.
-
-**Do NOT overwrite or modify:**
-- Any text the user has typed under existing HEADING_3 sections
-- The Thoughts / Ideas section content
-- The Random Fact line
-
-Execute the batchUpdate:
-```bash
-gws-safe docs documents batchUpdate --json '{"requests":[...]}' --params '{"documentId":"<DOC_ID>"}'
-```
-This is a write operation. Present the dry-run to the user, get confirmation, then execute with `--confirmed <nonce>`.
-
-If there are no changes to make, report "Task List is already up to date" and stop without executing a batchUpdate.
-
-Report what was updated.
-
-## Step 7: Update cache
-
-After a successful batchUpdate, re-read the document and repopulate the cache:
-```bash
-gws-safe docs documents get --params '{"documentId":"<DOC_ID>"}'
-```
-Parse the full document structure (all entries and their sections/subsections) and run:
-```bash
-daily-log-cache populate --json '{"document_id":"<DOC_ID>","revision_id":"<REVISION_ID>","entries":[...]}'
-```
-Include ALL entries with their updated indices and the new revision_id.
-
-## Error Handling
-
-- If any gws-safe command fails, report the error and stop.
-- If the user declines a write operation, stop and report that the operation was cancelled.
-- If calendar or tasks APIs return empty results, proceed with empty lists.

@@ -45,6 +45,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | Ryan | Implementation Specialist — takes validated research, plans, and requirements and turns them into working skills, commands, workflows, and system configurations | `.claude/agents/ryan.md` |
 | Creed | QA Specialist — tests code, validates functions, catches bugs, edge cases, and security issues before release | `.claude/agents/creed.md` |
 | Kelly | Agent Refinement Specialist — reviews past sessions, evaluates agent performance, and updates configuration and prompts to improve future interactions | `.claude/agents/kelly.md` |
+| Stanley | Performance Engineer & Software Architect — makes systems efficient, streamlined, and free of unnecessary work | `.claude/agents/stanley.md` |
 
 ### Skills
 

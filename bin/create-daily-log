@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Deterministic Daily Log creator and updater.
+
+Handles both creation of new daily log entries and updating existing ones.
+Replaces the LLM-orchestrated daily-log skill with a direct Python
+implementation.
+
+Usage:
+    bin/create-daily-log [--auto-confirm] [--fact "Your fact here"]
+"""
+
+import argparse
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    FRESHDESK_TICKET_URL,
+    REPO_ROOT,
+    execute_batch_update,
+    fetch_calendar_events,
+    fetch_open_tickets,
+    fetch_tasks,
+    format_event_time,
+    read_configs,
+    sort_entries,
+    update_cache,
+    utf16_len,
+)
+
+
+# --- Check if today's entry exists ---
+
+
+def check_today_entry(doc_id, today_str):
+    """Check the daily-log-cache for today's entry. Returns True if it exists."""
+    from lib.daily_log_utils import get_cache_db
+
+    db = get_cache_db()
+    entry = db.execute(
+        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
+        (doc_id, today_str),
+    ).fetchone()
+    db.close()
+    return entry is not None
+
+
+# --- Update path (Phase 1) ---
+
+
+def run_update_path(auto_confirm):
+    """Run the two update sub-scripts in sequence."""
+    print("\n--- Updating Task List ---")
+    cmd = [str(REPO_ROOT / "bin" / "update-task-list")]
+    if auto_confirm:
+        cmd.append("--auto-confirm")
+    result = subprocess.run(cmd, text=True)
+    if result.returncode not in (0, 2):
+        print(
+            f"WARNING: update-task-list exited with code {result.returncode}",
+            file=sys.stderr,
+        )
+
+    print("\n--- Updating Open Tickets ---")
+    cmd = [str(REPO_ROOT / "bin" / "update-open-tickets")]
+    if auto_confirm:
+        cmd.append("--auto-confirm")
+    result = subprocess.run(cmd, text=True)
+    if result.returncode not in (0, 2):
+        print(
+            f"WARNING: update-open-tickets exited with code {result.returncode}",
+            file=sys.stderr,
+        )
+
+
+# --- Create path (Phase 2) ---
+
+
+def build_entry_text(today_heading, events, in_progress_tasks, waiting_tasks, tickets, fact_text):
+    """Build the full daily log entry as a single text string.
+
+    Returns (text, line_metadata) where line_metadata is a list of dicts
+    describing each line for formatting purposes.
+    """
+    lines = []
+    meta = []  # parallel list: one metadata dict per line
+
+    def add_line(text, style, **kwargs):
+        lines.append(text)
+        meta.append({"style": style, **kwargs})
+
+    # Date heading
+    add_line(today_heading, "HEADING_1")
+
+    # Task List heading
+    add_line("Task List", "HEADING_2")
+
+    # Priorities label
+    add_line("\U0001f3af Priorities:", "NORMAL_TEXT", is_section_label=True)
+
+    # Priority items: all-day events (alpha), timed events (by start), tasks (list order)
+    sorted_items = sort_entries(events, in_progress_tasks)
+    for item, item_type in sorted_items:
+        if item_type == "event":
+            time_str = format_event_time(item)
+            add_line(f"(event) {item['summary']} {time_str}", "NORMAL_TEXT", bullet="default")
+        else:
+            add_line(f"(task) {item['title']}", "NORMAL_TEXT", bullet="default")
+
+    # Waiting / Blockers label
+    add_line("\u23f3 Waiting / Blockers:", "NORMAL_TEXT", is_section_label=True)
+
+    # Waiting items
+    if waiting_tasks:
+        for t in waiting_tasks:
+            add_line(t["title"], "NORMAL_TEXT", bullet="default")
+    else:
+        add_line("None", "NORMAL_TEXT", bullet="default")
+
+    # Random Fact label
+    add_line("\U0001f3b2 Random Fact:", "NORMAL_TEXT", is_section_label=True)
+
+    # Fact text
+    add_line(fact_text, "NORMAL_TEXT")
+
+    # Open Tickets heading
+    add_line("Open Tickets:", "HEADING_2")
+
+    # Ticket items
+    if tickets:
+        for t in tickets:
+            tid = t["freshdesk_ticket_id"]
+            name = t["requester_name"]
+            subject = t["subject"]
+            url = FRESHDESK_TICKET_URL.format(tid)
+            add_line(f"[{tid}] {name} - {subject} - {url}", "NORMAL_TEXT", bullet="checkbox")
+    else:
+        add_line("None", "NORMAL_TEXT", bullet="checkbox")
+
+    # Thoughts / Ideas heading
+    add_line("Thoughts / Ideas:", "HEADING_2")
+
+    # Empty line for user to type in
+    add_line("", "NORMAL_TEXT")
+
+    # Notes heading
+    add_line("Notes", "HEADING_2")
+
+    # Notes sub-sections: same ordering as priorities
+    for item, item_type in sorted_items:
+        if item_type == "event":
+            title = item["summary"]
+            link_url = item.get("support_doc_url") or item.get("html_link", "")
+        else:
+            title = item["title"]
+            link_url = item.get("web_view_link", "")
+
+        add_line(title, "HEADING_3")
+        if link_url:
+            add_line(link_url, "NORMAL_TEXT", is_link_line=True, link_url=link_url)
+
+    # Build the full text block (each line gets a trailing newline)
+    full_text = "\n".join(lines) + "\n"
+
+    return full_text, meta
+
+
+def build_batch_update(full_text, meta, style):
+    """Build the batchUpdate JSON for inserting and formatting the entry.
+
+    The entry is inserted as a single insertText at index 1, then formatting
+    is applied via subsequent requests.
+    """
+    requests = []
+
+    # 1. Insert all text at index 1
+    requests.append({
+        "insertText": {
+            "location": {"index": 1},
+            "text": full_text,
+        }
+    })
+
+    # Calculate end of all inserted text
+    total_len = utf16_len(full_text)
+    text_end = 1 + total_len
+
+    # 2. Reset everything to NORMAL_TEXT first (inserted text inherits previous style)
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": 1, "endIndex": text_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Walk through lines and build formatting requests
+    # Split text into lines to calculate indices
+    lines = full_text.split("\n")
+    # The last element after split is empty (trailing \n), so lines has one extra
+    # But we track via meta which has the real line count
+
+    heading_ranges = []  # (start, end) for all HEADING_1/2/3
+    normal_ranges = []   # (start, end) for all NORMAL_TEXT
+    default_bullet_ranges = []  # (start, end) for default bullet items
+    checkbox_bullet_ranges = []  # (start, end) for checkbox bullet items
+    link_lines = []  # (start, text_end, line_end, url)
+
+    cursor = 1  # start after the insertion point
+    for i, m in enumerate(meta):
+        line_text = lines[i]
+        line_with_newline = line_text + "\n"
+        line_start = cursor
+        line_end = cursor + utf16_len(line_with_newline)
+
+        style_type = m["style"]
+
+        if style_type in ("HEADING_1", "HEADING_2", "HEADING_3"):
+            # Apply heading paragraph style
+            requests.append({
+                "updateParagraphStyle": {
+                    "range": {"startIndex": line_start, "endIndex": line_end},
+                    "paragraphStyle": {"namedStyleType": style_type},
+                    "fields": "namedStyleType",
+                }
+            })
+            heading_ranges.append((line_start, line_end))
+        else:
+            normal_ranges.append((line_start, line_end))
+
+        # Track bullet ranges
+        bullet_type = m.get("bullet")
+        if bullet_type == "default":
+            default_bullet_ranges.append((line_start, line_end))
+        elif bullet_type == "checkbox":
+            checkbox_bullet_ranges.append((line_start, line_end))
+
+        # Track link lines
+        if m.get("is_link_line"):
+            link_text_end = line_start + utf16_len(line_text)
+            link_lines.append((line_start, link_text_end, line_end, m["link_url"]))
+
+        cursor = line_end
+
+    # 4. Apply bullets on contiguous ranges
+    # Default bullets (priorities + waiting items)
+    if default_bullet_ranges:
+        for group_start, group_end in _merge_contiguous_ranges(default_bullet_ranges):
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": group_start, "endIndex": group_end},
+                    "bulletPreset": style["bulletPresets"]["default"],
+                }
+            })
+
+    # Checkbox bullets (open tickets)
+    if checkbox_bullet_ranges:
+        for group_start, group_end in _merge_contiguous_ranges(checkbox_bullet_ranges):
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": group_start, "endIndex": group_end},
+                    "bulletPreset": style["bulletPresets"]["checkbox"],
+                }
+            })
+
+    # 5. Font styling on headings
+    heading_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
+    }
+    heading_fields = "weightedFontFamily"
+    if style["colors"].get("headingText"):
+        heading_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["headingText"]}
+        }
+        heading_fields += ",foregroundColor"
+
+    for start, end in heading_ranges:
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": start, "endIndex": end},
+                "textStyle": heading_text_style,
+                "fields": heading_fields,
+            }
+        })
+
+    # 6. Font styling on normal text
+    body_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    body_fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        body_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        body_fields += ",foregroundColor"
+
+    for start, end in normal_ranges:
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": start, "endIndex": end},
+                "textStyle": body_text_style,
+                "fields": body_fields,
+            }
+        })
+
+    # 7. Link styling on Notes URL lines
+    for link_start, link_text_end, link_line_end, link_url in link_lines:
+        # Body font on the link line
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": link_start, "endIndex": link_line_end},
+                "textStyle": body_text_style,
+                "fields": body_fields,
+            }
+        })
+        # Hyperlink on the URL text (excluding trailing newline)
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": link_start, "endIndex": link_text_end},
+                "textStyle": {"link": {"url": link_url}},
+                "fields": "link",
+            }
+        })
+
+    return {"requests": requests}
+
+
+def _merge_contiguous_ranges(ranges):
+    """Merge contiguous (start, end) ranges where one ends where the next begins."""
+    if not ranges:
+        return []
+    sorted_ranges = sorted(ranges, key=lambda r: r[0])
+    merged = [sorted_ranges[0]]
+    for start, end in sorted_ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start == prev_end:
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+# --- Main ---
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create or update the daily log entry"
+    )
+    parser.add_argument(
+        "--auto-confirm",
+        action="store_true",
+        help="Automatically confirm the batchUpdate write",
+    )
+    parser.add_argument(
+        "--fact",
+        type=str,
+        default="No historical fact provided.",
+        help="A random/historical fact to include in the entry",
+    )
+    args = parser.parse_args()
+    auto_confirm = args.auto_confirm
+    fact_text = args.fact.replace("\n", " ").replace("\r", "")
+
+    # Step 1: Read configs
+    config, style = read_configs()
+    doc_id = config["documentId"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_heading = datetime.now().strftime("%A %b %-d, %Y")
+
+    print(f"Daily Log for {today_heading}")
+    print(f"Document ID: {doc_id}")
+
+    # Step 2: Check if today's entry exists in cache
+    entry_exists = check_today_entry(doc_id, today_str)
+
+    if entry_exists:
+        # Phase 1: Update path
+        print("\nToday's entry already exists. Running update path...")
+        run_update_path(auto_confirm)
+        print("\nDaily log update complete.")
+        return
+
+    # Phase 2: Create path
+    print("\nNo entry for today. Creating new daily log entry...")
+
+    # Step 3: Get timezone offset
+    tz_result = subprocess.run(
+        ["date", "+%:z"], capture_output=True, text=True
+    )
+    tz_offset = tz_result.stdout.strip()
+
+    # Step 4: Fetch all data
+    events = fetch_calendar_events(config, today_str, tz_offset)
+    in_progress_tasks, waiting_tasks = fetch_tasks(config, today_str)
+    tickets = fetch_open_tickets()
+
+    print(f"Found {len(events)} calendar event(s)")
+    print(f"Found {len(in_progress_tasks)} in-progress task(s)")
+    print(f"Found {len(waiting_tasks)} waiting task(s) due today")
+    print(f"Found {len(tickets)} open ticket(s)")
+
+    # Step 5: Build entry text
+    full_text, meta = build_entry_text(
+        today_heading, events, in_progress_tasks, waiting_tasks, tickets, fact_text
+    )
+
+    # Step 6: Build batchUpdate
+    batch = build_batch_update(full_text, meta, style)
+
+    # Step 7: Execute batchUpdate
+    success = execute_batch_update(doc_id, batch, auto_confirm)
+
+    if not success:
+        # Dry-run only, not confirmed
+        sys.exit(2)
+
+    # Step 8: Update cache
+    update_cache(doc_id)
+
+    # Step 9: Run update path to fill in dynamic sub-sections
+    print("\nEntry created. Running update path to fill in sub-sections...")
+    run_update_path(auto_confirm)
+
+    # Report summary
+    sorted_items = sort_entries(events, in_progress_tasks)
+    print(f"\nDaily log entry created for {today_heading}:")
+    print(f"  {len(events)} calendar event(s)")
+    print(f"  {len(in_progress_tasks)} in-progress task(s)")
+    print(f"  {len(waiting_tasks)} waiting task(s)")
+    print(f"  {len(tickets)} open ticket(s)")
+    print(f"  {len(sorted_items)} Notes sub-section(s)")
+    print(f"  Fact: {fact_text}")
+
+
+if __name__ == "__main__":
+    main()

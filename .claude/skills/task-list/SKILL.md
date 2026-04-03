@@ -139,7 +139,7 @@ Build a batchUpdate request that:
 - Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on new NORMAL_TEXT paragraphs
 - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
 - Apply `createParagraphBullets` on new bullet items
-- For each new HEADING_3 that has a link URL, apply `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on the heading text range (from heading start index to heading end index minus 1, excluding the trailing newline). Place these link requests AFTER the paragraph style and font requests.
+- For each new HEADING_3 that has a link URL, insert a NORMAL_TEXT line immediately after the heading containing the link URL text, then apply `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on that URL text (excluding the trailing newline). Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` on the link line. Place these link requests AFTER the paragraph style and font requests.
 
 For event times, format as `h:mm AM/PM` (e.g., `9:00 AM`). For all-day events, use `all day`.
 

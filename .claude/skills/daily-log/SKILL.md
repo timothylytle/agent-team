@@ -134,7 +134,9 @@ Thoughts / Ideas:
 
 Notes
 [Task/Event 1 title]
+[link URL if available]
 [Task/Event 2 title]
+[link URL if available]
 ```
 
 For event times, format as `h:mm AM/PM` (e.g., `9:00 AM`). For all-day events, use `all day`.
@@ -160,7 +162,7 @@ Build a `batchUpdate` request that inserts the entry at the TOP of the document 
    - If `colors.headingText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.headingText>}}` in the heading `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
    - `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` and `fields: "weightedFontFamily"` on all NORMAL_TEXT paragraphs (section labels, random fact text, bullet items)
    - If `colors.bodyText` in the style config is not null, include `foregroundColor: {"color": {"rgbColor": <colors.bodyText>}}` in the body `updateTextStyle` request (add `"foregroundColor"` to the `fields` mask)
-   - After the font styling requests, apply hyperlinks on each Notes HEADING_3 heading: `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on the heading text range (from heading start index to heading end index minus 1, excluding the trailing newline). For events with a `Support Doc:` URL in their description, use the doc URL. For events without a support doc, use the event's `htmlLink`. For tasks, use the task's `webViewLink` (if available).
+   - After the font styling requests, for each Notes HEADING_3 that has a link URL, insert a NORMAL_TEXT line immediately after the heading containing the link URL text, then apply `updateTextStyle` with `link: {"url": "<LINK_URL>"}` and `fields: "link"` on that URL text (excluding the trailing newline). Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "<fonts.body from style config>"}` on the link line. For events with a `Support Doc:` URL in their description, use the doc URL. For events without a support doc, use the event's `htmlLink`. For tasks, use the task's `webViewLink` (if available).
 
 **Index calculation:** After inserting text at index 1, count characters from index 1 to determine the start and end index of each line. Remember that each newline character (`\n`) counts as 1 character.
 

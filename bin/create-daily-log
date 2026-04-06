@@ -362,8 +362,14 @@ def main():
         default="No historical fact provided.",
         help="A random/historical fact to include in the entry",
     )
+    parser.add_argument(
+        "--skip-archive",
+        action="store_true",
+        help="Skip archiving old entries after creating a new one",
+    )
     args = parser.parse_args()
     auto_confirm = args.auto_confirm
+    skip_archive = args.skip_archive
     fact_text = args.fact.replace("\n", " ").replace("\r", "")
 
     # Step 1: Read configs
@@ -435,6 +441,19 @@ def main():
     print(f"  {len(tickets)} open ticket(s)")
     print(f"  {len(sorted_items)} Notes sub-section(s)")
     print(f"  Fact: {fact_text}")
+
+    # Step 10: Archive old entries
+    if not skip_archive:
+        print("\n--- Archiving Old Entries ---")
+        archive_cmd = [str(REPO_ROOT / "bin" / "archive-daily-log")]
+        if auto_confirm:
+            archive_cmd.append("--auto-confirm")
+        result = subprocess.run(archive_cmd, text=True)
+        if result.returncode not in (0, 2):
+            print(
+                f"WARNING: archive-daily-log exited with code {result.returncode}",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

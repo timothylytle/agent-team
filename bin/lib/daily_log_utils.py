@@ -141,10 +141,21 @@ def get_cache_db():
             subject TEXT,
             requester_id INTEGER,
             requester_name TEXT,
+            status INTEGER,
+            priority INTEGER,
             fetched_at TEXT NOT NULL
         )
     """
     )
+    # Migrate: add status/priority columns if missing (pre-existing databases)
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(open_tickets_snapshot)").fetchall()
+    }
+    if "status" not in cols:
+        conn.execute("ALTER TABLE open_tickets_snapshot ADD COLUMN status INTEGER")
+    if "priority" not in cols:
+        conn.execute("ALTER TABLE open_tickets_snapshot ADD COLUMN priority INTEGER")
     conn.commit()
     return conn
 
@@ -441,9 +452,10 @@ def fetch_open_tickets():
         db.execute("DELETE FROM open_tickets_snapshot")
         db.execute(
             "INSERT INTO open_tickets_snapshot "
-            "(freshdesk_ticket_id, subject, requester_id, requester_name, fetched_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (-1, "__empty__", 0, "", now_iso),
+            "(freshdesk_ticket_id, subject, requester_id, requester_name, "
+            "status, priority, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (-1, "__empty__", 0, "", None, None, now_iso),
         )
         db.commit()
         db.close()
@@ -484,13 +496,16 @@ def fetch_open_tickets():
     for t in result_tickets:
         db.execute(
             "INSERT INTO open_tickets_snapshot "
-            "(freshdesk_ticket_id, subject, requester_id, requester_name, fetched_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(freshdesk_ticket_id, subject, requester_id, requester_name, "
+            "status, priority, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 t["freshdesk_ticket_id"],
                 t["subject"],
                 t["requester_id"],
                 t["requester_name"],
+                t.get("status"),
+                t.get("priority"),
                 t["fetched_at"],
             ),
         )

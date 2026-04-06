@@ -1,0 +1,1203 @@
+#!/usr/bin/env python3
+"""Deterministic Support Notes updater.
+
+Creates Google Docs for support notes in a Shared Drive for open FreshDesk
+tickets, links them back via private notes, records them in the CRM, and
+injects support-bot tagged notes into the docs.
+
+Replaces the LLM-orchestrated support-notes skill with a direct Python
+implementation.
+
+Usage:
+    bin/update-support-notes [--auto-confirm] [--skip-unmatched] [--dry-run]
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    FRESHDESK_SAFE,
+    FRESHDESK_TICKET_URL,
+    GWS_SAFE,
+    CRM_SAFE,
+    run_cmd,
+    utf16_len,
+)
+from lib.support_utils import (
+    SHARED_DRIVE_NAME,
+    auto_confirm_freshdesk,
+    auto_confirm_gws,
+    build_link_style_request,
+    build_paragraph_style_request,
+    build_text_style_request,
+    ensure_crm_records,
+    extract_domain_keyword,
+    fetch_active_tickets,
+    lookup_freshdesk_contact,
+    read_style_config,
+    resolve_crm_entity,
+    scan_ticket_notes,
+    slugify,
+)
+
+
+# --- HTML parsing for support-bot notes ---
+
+
+def parse_note_html(html):
+    """Parse a FreshDesk note's HTML body to extract text, links, and images.
+
+    Strips the support-bot mention, extracts plain text with link/image tracking.
+
+    Returns:
+        dict with keys: text, links, images
+        links: list of {"start": N, "end": N, "url": "..."}
+        images: list of {"offset": N, "url": "...", "width": W, "height": H}
+    """
+    # Remove support-bot mention
+    html = re.sub(r"@?support[- ]bot", "", html, flags=re.IGNORECASE)
+
+    # Replace block-level closing tags with newlines
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</p>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</div>", "\n", html, flags=re.IGNORECASE)
+
+    IMG_PLACEHOLDER = "\uFFFC"
+    # Use private-use-area chars as unique link boundary markers
+    LINK_START = "\uFFFD"
+    LINK_END = "\uFFFE"
+
+    tag_re = re.compile(
+        r'(<a\s+[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>'
+        r'|<img\s+[^>]*src=["\']([^"\']*)["\'][^>]*/?>|<[^>]+>)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    size_re = re.compile(
+        r'(?:width=["\'](\d+)["\']|height=["\'](\d+)["\'])', re.IGNORECASE
+    )
+
+    clean_pos = 0
+    clean_text = ""
+    raw_links_urls = []  # url for each link, in order
+    raw_images = []  # (url, width, height)
+
+    for m in tag_re.finditer(html):
+        clean_text += html[clean_pos : m.start()]
+        if m.group(3) is not None:  # <a> tag
+            link_text = re.sub(r"<[^>]+>", "", m.group(3))
+            clean_text += LINK_START + link_text + LINK_END
+            raw_links_urls.append(m.group(2))
+        elif m.group(4) is not None:  # <img> tag
+            tag_str = m.group(0)
+            sizes = size_re.findall(tag_str)
+            w, h = None, None
+            for sw, sh in sizes:
+                if sw:
+                    w = int(sw)
+                if sh:
+                    h = int(sh)
+            raw_images.append((m.group(4), w, h))
+            clean_text += IMG_PLACEHOLDER
+        clean_pos = m.end()
+
+    clean_text += html[clean_pos:]
+
+    # Collapse excessive newlines and strip
+    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
+    clean_text = clean_text.strip()
+
+    # Find image positions (in text that still has all markers)
+    image_positions = [i for i, ch in enumerate(clean_text) if ch == IMG_PLACEHOLDER]
+
+    # Find link positions by scanning for start/end markers
+    links = []
+    link_idx = 0
+    marker_positions = []  # positions of all markers to remove later
+    i = 0
+    while i < len(clean_text):
+        ch = clean_text[i]
+        if ch == LINK_START:
+            marker_positions.append(i)
+            # Find matching end marker
+            end = clean_text.index(LINK_END, i + 1)
+            marker_positions.append(end)
+            # Link text is between the markers (exclusive)
+            link_start_in_marked = i + 1
+            link_end_in_marked = end
+            links.append({
+                "start_marked": link_start_in_marked,
+                "end_marked": link_end_in_marked,
+                "url": raw_links_urls[link_idx],
+            })
+            link_idx += 1
+            i = end + 1
+        else:
+            i += 1
+
+    # Remove all markers (link start/end and image placeholders) to build final text
+    all_marker_chars = {IMG_PLACEHOLDER, LINK_START, LINK_END}
+    marker_indices = sorted(
+        i for i, ch in enumerate(clean_text) if ch in all_marker_chars
+    )
+
+    final_text = "".join(
+        ch for i, ch in enumerate(clean_text) if ch not in all_marker_chars
+    )
+
+    # Build a mapping: position in marked text -> position in final text
+    # For any position p in clean_text, the final position is p minus the
+    # number of marker chars at indices < p.
+    def adjusted_pos(p):
+        # Count markers before position p
+        lo, hi = 0, len(marker_indices)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if marker_indices[mid] < p:
+                lo = mid + 1
+            else:
+                hi = mid
+        return p - lo
+
+    # Calculate image offsets
+    images = []
+    for idx, pos in enumerate(image_positions):
+        url, w, h = raw_images[idx]
+        img_record = {"offset": adjusted_pos(pos), "url": url}
+        if w is not None:
+            img_record["width"] = w
+        if h is not None:
+            img_record["height"] = h
+        images.append(img_record)
+
+    # Calculate link positions in final text
+    final_links = []
+    for link in links:
+        final_links.append({
+            "start": adjusted_pos(link["start_marked"]),
+            "end": adjusted_pos(link["end_marked"]),
+            "url": link["url"],
+        })
+
+    return {"text": final_text, "links": final_links, "images": images}
+
+
+# --- Shared Drive operations ---
+
+
+def find_shared_drive():
+    """Find the Customers Shared Drive. Returns drive_id or exits."""
+    print("Finding Customers Shared Drive...")
+    stdout, _, _ = run_cmd([GWS_SAFE, "drive", "drives", "list"])
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse drives list output", file=sys.stderr)
+        sys.exit(1)
+
+    for drive in data.get("drives", []):
+        if drive.get("name") == SHARED_DRIVE_NAME:
+            drive_id = drive["id"]
+            print(f"  Found Shared Drive: {drive_id}")
+            return drive_id
+
+    print(f"ERROR: Shared Drive '{SHARED_DRIVE_NAME}' not found", file=sys.stderr)
+    sys.exit(1)
+
+
+def find_customer_folder(drive_id, company_name):
+    """Find a customer's top-level folder in the Shared Drive. Returns folder_id or None."""
+    params = {
+        "q": f'name="{company_name}" and mimeType="application/vnd.google-apps.folder" and "{drive_id}" in parents',
+        "driveId": drive_id,
+        "corpora": "drive",
+        "includeItemsFromAllDrives": True,
+        "supportsAllDrives": True,
+    }
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "drive", "files", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+    files = data.get("files", [])
+    if files:
+        return files[0]["id"]
+    return None
+
+
+def find_support_subfolder(drive_id, customer_folder_id):
+    """Find the 'support' subfolder under a customer folder. Returns folder_id or None."""
+    params = {
+        "q": f'name="support" and mimeType="application/vnd.google-apps.folder" and "{customer_folder_id}" in parents',
+        "driveId": drive_id,
+        "corpora": "drive",
+        "includeItemsFromAllDrives": True,
+        "supportsAllDrives": True,
+    }
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "drive", "files", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+    files = data.get("files", [])
+    if files:
+        return files[0]["id"]
+    return None
+
+
+def create_support_subfolder(customer_folder_id, auto_confirm):
+    """Create a 'support' subfolder. Returns (folder_id, success)."""
+    cmd_args = [
+        "drive", "files", "create",
+        "--params", json.dumps({"supportsAllDrives": True}),
+        "--json", json.dumps({
+            "name": "support",
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [customer_folder_id],
+        }),
+    ]
+    stdout, success = auto_confirm_gws(cmd_args, auto_confirm, "Create support folder")
+    if not success:
+        return None, False
+    try:
+        data = json.loads(stdout)
+        return data["id"], True
+    except (json.JSONDecodeError, KeyError):
+        return None, False
+
+
+def search_drive_for_keyword(drive_id, keyword):
+    """Search the Shared Drive for folders matching a keyword. Returns list of (name, id)."""
+    params = {
+        "q": f"name contains '{keyword}' and mimeType='application/vnd.google-apps.folder' and '{drive_id}' in parents",
+        "driveId": drive_id,
+        "corpora": "drive",
+        "includeItemsFromAllDrives": True,
+        "supportsAllDrives": True,
+    }
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "drive", "files", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+
+    return [(f["name"], f["id"]) for f in data.get("files", [])]
+
+
+# --- Doc creation and population ---
+
+
+def create_google_doc(support_folder_id, doc_name, auto_confirm):
+    """Create a Google Doc in the support folder. Returns (doc_id, web_view_link, success)."""
+    cmd_args = [
+        "drive", "files", "create",
+        "--params", json.dumps({"supportsAllDrives": True}),
+        "--json", json.dumps({
+            "name": doc_name,
+            "mimeType": "application/vnd.google-apps.document",
+            "parents": [support_folder_id],
+        }),
+    ]
+    stdout, success = auto_confirm_gws(cmd_args, auto_confirm, f"Create doc '{doc_name}'")
+    if not success:
+        return None, None, False
+    try:
+        data = json.loads(stdout)
+        return data["id"], data.get("webViewLink", ""), True
+    except (json.JSONDecodeError, KeyError):
+        return None, None, False
+
+
+def populate_doc(doc_id, ticket, requester_name, requester_email, company_name, style, auto_confirm):
+    """Populate a new support doc with initial content.
+
+    Document structure:
+        [Ticket Subject]              <- HEADING_1
+        FreshDesk Ticket              <- NORMAL_TEXT with link
+        Support issue: {subject}      <- NORMAL_TEXT
+        Key Facts                     <- HEADING_2
+        Requestor: Name (email)       <- NORMAL_TEXT
+        Company: Company Name         <- NORMAL_TEXT
+    """
+    ticket_id = ticket["freshdesk_ticket_id"]
+    subject = ticket["subject"]
+    ticket_url = FRESHDESK_TICKET_URL.format(ticket_id)
+    issue_desc = f"Support issue: {subject}"
+
+    # Build text content - all inserted at index 1
+    lines = [
+        subject,
+        "FreshDesk Ticket",
+        issue_desc,
+        "Key Facts",
+        f"Requestor: {requester_name} ({requester_email})",
+        f"Company: {company_name}",
+    ]
+    insert_text = "\n".join(lines) + "\n"
+
+    requests = []
+
+    # 1. Insert all text at index 1
+    requests.append({
+        "insertText": {
+            "location": {"index": 1},
+            "text": insert_text,
+        }
+    })
+
+    # 2. Calculate indices for formatting
+    idx = 1
+    line_ranges = []
+    for line in lines:
+        line_len = utf16_len(line)
+        line_start = idx
+        line_end = idx + line_len
+        # Include the newline in the paragraph range for paragraph style
+        para_end = line_end + 1  # +1 for \n
+        line_ranges.append((line_start, line_end, para_end))
+        idx = para_end
+
+    # Subject line (index 0) - HEADING_1
+    subj_start, subj_end, subj_para_end = line_ranges[0]
+    requests.append(build_paragraph_style_request(subj_start, subj_para_end, "HEADING_1"))
+    requests.append(build_text_style_request(subj_start, subj_end, style, is_heading=True))
+
+    # "Key Facts" line (index 3) - HEADING_2
+    kf_start, kf_end, kf_para_end = line_ranges[3]
+    requests.append(build_paragraph_style_request(kf_start, kf_para_end, "HEADING_2"))
+    requests.append(build_text_style_request(kf_start, kf_end, style, is_heading=True))
+
+    # Body text styling for NORMAL_TEXT lines (indices 1, 2, 4, 5)
+    for i in [1, 2, 4, 5]:
+        ls, le, _ = line_ranges[i]
+        requests.append(build_text_style_request(ls, le, style, is_heading=False))
+
+    # Link on "FreshDesk Ticket" text
+    ft_start, ft_end, _ = line_ranges[1]
+    requests.append(build_link_style_request(ft_start, ft_end, ticket_url))
+
+    # Execute batchUpdate
+    batch = {"requests": requests}
+    cmd_args = [
+        "docs", "documents", "batchUpdate",
+        "--json", json.dumps(batch),
+        "--params", json.dumps({"documentId": doc_id}),
+    ]
+    _, success = auto_confirm_gws(cmd_args, auto_confirm, f"Populate doc for ticket #{ticket_id}")
+    return success
+
+
+def add_freshdesk_note(ticket_id, web_view_link, auto_confirm):
+    """Add a private note to a FreshDesk ticket linking to the support doc.
+
+    Returns (note_stdout, success).
+    """
+    body = f"Support notes: {web_view_link}"
+    cmd_args = [
+        "tickets", "note", str(ticket_id),
+        "--body", body,
+        "--private", "true",
+    ]
+    return auto_confirm_freshdesk(cmd_args, auto_confirm, f"Add note to ticket #{ticket_id}")
+
+
+def link_doc_in_crm(doc_id, doc_name, web_view_link, company_id):
+    """Create a CRM drive file record and link it to the company."""
+    # Create the file record
+    file_data = {
+        "google_file_id": doc_id,
+        "name": doc_name,
+        "mime_type": "application/vnd.google-apps.document",
+        "web_view_link": web_view_link,
+    }
+    stdout, _, _ = run_cmd(
+        [CRM_SAFE, "files", "create", "--json", json.dumps(file_data)]
+    )
+    try:
+        created = json.loads(stdout)
+        file_id = created["id"]
+    except (json.JSONDecodeError, KeyError):
+        print(f"  WARNING: failed to create CRM file record for {doc_name}", file=sys.stderr)
+        return False
+
+    # Link to company
+    stdout, _, _ = run_cmd(
+        [CRM_SAFE, "files", "link",
+         "--company-id", str(company_id),
+         "--file-id", str(file_id)]
+    )
+    return True
+
+
+# --- Support-bot note injection (Step 9e) ---
+
+
+def inject_tagged_notes(ticket_id, doc_id, conversations, style, auto_confirm):
+    """Inject support-bot tagged notes into a support doc.
+
+    Args:
+        ticket_id: FreshDesk ticket ID
+        doc_id: Google Doc ID
+        conversations: list of conversation objects from FreshDesk
+        style: doc_styles.json config
+        auto_confirm: whether to auto-confirm writes
+
+    Returns:
+        dict with keys: injected_count, skipped_images, errors
+    """
+    result = {"injected_count": 0, "skipped_images": [], "errors": []}
+
+    # Find tagged notes
+    tagged_notes = []
+    for conv in conversations:
+        is_private = conv.get("private", False) or conv.get("source") == 2
+        if not is_private:
+            continue
+        body_text = conv.get("body_text", "") or ""
+        if re.search(r"support[- ]bot", body_text, re.IGNORECASE):
+            tagged_notes.append(conv)
+
+    if not tagged_notes:
+        return result
+
+    print(f"  Found {len(tagged_notes)} support-bot tagged note(s) for ticket #{ticket_id}")
+
+    # Read the support doc
+    doc = _fetch_support_doc(doc_id)
+    if not doc:
+        result["errors"].append(f"Failed to fetch doc {doc_id}")
+        return result
+
+    for note in tagged_notes:
+        # Check for duplicate injection
+        created_at = note.get("created_at", "")
+        formatted_date = _format_note_date(created_at)
+        if formatted_date:
+            dedup_key = formatted_date
+        else:
+            # Fallback: use first 50 chars of body text for dedup
+            dedup_key = (note.get("body_text", "") or "")[:50].strip()
+        if dedup_key and _note_already_injected(doc, dedup_key):
+            print(f"    Skipping already-injected note ({dedup_key})")
+            continue
+
+        # Resolve author
+        user_id = note.get("user_id")
+        author_name = "Unknown"
+        if user_id:
+            contact = lookup_freshdesk_contact(user_id)
+            if contact:
+                author_name = contact.get("name", "Unknown") or "Unknown"
+
+        # Parse HTML content
+        body_html = note.get("body", "")
+        parsed = parse_note_html(body_html)
+
+        # Build section text
+        note_date_prefix = _format_note_date_prefix(created_at)
+        heading_text = f"{note_date_prefix}-ticket-note"
+        section_lines = [
+            heading_text,
+            f"Created: {formatted_date}",
+            f"Author: {author_name}",
+            "",  # blank line
+        ]
+        content_text = parsed["text"]
+        section_text = "\n".join(section_lines) + "\n" + content_text + "\n"
+
+        # Find insertion point (end of doc content)
+        body_content = doc.get("body", {}).get("content", [])
+        if not body_content:
+            result["errors"].append(f"Doc {doc_id} has no body content")
+            break
+        last_element = body_content[-1]
+        insert_index = last_element.get("endIndex", 1) - 1
+
+        # Build batchUpdate
+        requests = _build_note_injection_requests(
+            section_text, heading_text, section_lines, content_text,
+            parsed, insert_index, style, ticket_id,
+        )
+
+        if not requests:
+            continue
+
+        # Execute batchUpdate
+        batch = {"requests": requests}
+        cmd_args = [
+            "docs", "documents", "batchUpdate",
+            "--json", json.dumps(batch),
+            "--params", json.dumps({"documentId": doc_id}),
+        ]
+        stdout, success = auto_confirm_gws(
+            cmd_args, auto_confirm,
+            f"Inject note into doc for ticket #{ticket_id}",
+        )
+
+        if not success:
+            # Try without images if there were images
+            image_requests = [r for r in requests if "insertInlineImage" in r]
+            if image_requests:
+                print(f"    Retrying without inline images...")
+                text_requests = [r for r in requests if "insertInlineImage" not in r]
+                batch = {"requests": text_requests}
+                cmd_args = [
+                    "docs", "documents", "batchUpdate",
+                    "--json", json.dumps(batch),
+                    "--params", json.dumps({"documentId": doc_id}),
+                ]
+                stdout, success = auto_confirm_gws(
+                    cmd_args, auto_confirm,
+                    f"Inject note (no images) into doc for ticket #{ticket_id}",
+                )
+                if success:
+                    result["skipped_images"].extend(
+                        [r["insertInlineImage"]["uri"] for r in image_requests]
+                    )
+
+        if success:
+            result["injected_count"] += 1
+            # Re-read doc for next note (endIndex changes after injection)
+            doc = _fetch_support_doc(doc_id)
+            if not doc:
+                result["errors"].append(f"Failed to re-fetch doc {doc_id} after injection")
+                break
+        else:
+            result["errors"].append(f"Failed to inject note ({formatted_date}) into doc {doc_id}")
+
+    return result
+
+
+def _fetch_support_doc(doc_id):
+    """Fetch a Google Doc by ID."""
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "docs", "documents", "get", "--params", json.dumps({"documentId": doc_id})]
+    )
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _format_note_date(created_at):
+    """Format a FreshDesk note's created_at as 'YYYY-MM-DD HH:MM:SS (UTC)'.
+
+    Always returns a string. Returns empty string if created_at is None/empty.
+    """
+    if not created_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + " (UTC)"
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _format_note_date_prefix(created_at):
+    """Format a note's created_at as YYYYMMDD for the heading."""
+    try:
+        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        return dt.strftime("%Y%m%d")
+    except (ValueError, AttributeError):
+        return datetime.now().strftime("%Y%m%d")
+
+
+def _note_already_injected(doc, formatted_date):
+    """Check if a note with this timestamp has already been injected."""
+    body_content = doc.get("body", {}).get("content", [])
+    for element in body_content:
+        paragraph = element.get("paragraph", {})
+        for pe in paragraph.get("elements", []):
+            text = pe.get("textRun", {}).get("content", "")
+            if formatted_date in text:
+                return True
+    return False
+
+
+def _build_note_injection_requests(section_text, heading_text, section_lines,
+                                    content_text, parsed, insert_index, style, ticket_id):
+    """Build batchUpdate requests for injecting a note into a doc."""
+    requests = []
+
+    # 1. Insert text
+    requests.append({
+        "insertText": {
+            "location": {"index": insert_index},
+            "text": section_text,
+        }
+    })
+
+    # 2. Calculate indices
+    # The heading line starts at insert_index
+    idx = insert_index
+    heading_start = idx
+    heading_end = idx + utf16_len(heading_text)
+    heading_para_end = heading_end + 1  # +1 for \n
+
+    # NORMAL_TEXT for entire range first (reset inherited styles)
+    total_len = utf16_len(section_text)
+    requests.append(build_paragraph_style_request(
+        insert_index, insert_index + total_len, "NORMAL_TEXT"
+    ))
+
+    # HEADING_2 for heading line
+    requests.append(build_paragraph_style_request(heading_start, heading_para_end, "HEADING_2"))
+
+    # Heading font style
+    requests.append(build_text_style_request(heading_start, heading_end, style, is_heading=True))
+
+    # Body font style for metadata and content lines
+    # Metadata lines start after heading
+    metadata_start = heading_para_end
+    metadata_and_content_end = insert_index + total_len
+    if metadata_start < metadata_and_content_end:
+        requests.append(build_text_style_request(
+            metadata_start, metadata_and_content_end, style, is_heading=False
+        ))
+
+    # Calculate where content text starts (after heading + metadata lines + blank line)
+    content_offset = insert_index
+    for line in section_lines:
+        content_offset += utf16_len(line) + 1  # +1 for \n
+    # content_offset now points to start of content_text
+
+    # Apply link styles from parsed content
+    for link in parsed["links"]:
+        link_start = content_offset + link["start"]
+        link_end = content_offset + link["end"]
+        # Verify the range is within bounds
+        if link_start < metadata_and_content_end and link_end <= metadata_and_content_end:
+            requests.append(build_link_style_request(link_start, link_end, link["url"]))
+
+    # Build inline image insertions (sorted highest index first)
+    image_requests = []
+    for img in parsed["images"]:
+        img_index = content_offset + img["offset"]
+        img_req = {
+            "insertInlineImage": {
+                "location": {"index": img_index},
+                "uri": img["url"],
+            }
+        }
+        if "width" in img and "height" in img:
+            img_req["insertInlineImage"]["objectSize"] = {
+                "height": {"magnitude": img["height"], "unit": "PT"},
+                "width": {"magnitude": img["width"], "unit": "PT"},
+            }
+        image_requests.append(img_req)
+
+    # Sort by index descending (insert from end to start to preserve indices)
+    image_requests.sort(
+        key=lambda r: r["insertInlineImage"]["location"]["index"],
+        reverse=True,
+    )
+
+    # Images go after all text/styling requests
+    requests.extend(image_requests)
+
+    return requests
+
+
+# --- Main flow ---
+
+
+def parse_doc_id_from_url(body):
+    """Extract Google Doc ID from a note body containing a docs.google.com URL."""
+    match = re.search(r"docs\.google\.com/document/d/([^/\s]+)", body)
+    if match:
+        return match.group(1)
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create support note documents for open FreshDesk tickets"
+    )
+    parser.add_argument(
+        "--auto-confirm", action="store_true",
+        help="Automatically confirm all write operations",
+    )
+    parser.add_argument(
+        "--skip-unmatched", action="store_true",
+        help="Skip tickets whose requester domain can't be matched to a CRM company/Drive folder",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be created without doing it",
+    )
+    args = parser.parse_args()
+
+    auto_confirm = args.auto_confirm
+    skip_unmatched = args.skip_unmatched
+    dry_run = args.dry_run
+
+    if dry_run:
+        auto_confirm = False
+
+    # Step 0: Read style config
+    style = read_style_config()
+    print("Loaded style configuration")
+
+    # Step 1: Fetch active tickets
+    tickets = fetch_active_tickets()
+    if not tickets:
+        print("No assigned non-closed tickets found.")
+        sys.exit(0)
+
+    print(f"Found {len(tickets)} active ticket(s)")
+
+    # Step 2: Check for existing support docs (duplicate detection)
+    tickets_needing_docs = []
+    tickets_with_docs = []
+    conversations_cache = {}  # ticket_id -> conversations list
+
+    for ticket in tickets:
+        tid = ticket["freshdesk_ticket_id"]
+        print(f"  Checking ticket #{tid} for existing support doc...")
+        scan_result = scan_ticket_notes(tid, "docs.google.com/document")
+        conversations_cache[tid] = scan_result["conversations"]
+
+        if scan_result["found"]:
+            doc_id = parse_doc_id_from_url(scan_result["note_body"])
+            if doc_id:
+                tickets_with_docs.append({"ticket": ticket, "doc_id": doc_id})
+                print(f"    Has existing doc: {doc_id}")
+            else:
+                # Has a note but couldn't parse doc ID
+                tickets_with_docs.append({"ticket": ticket, "doc_id": None})
+                print(f"    Has doc link but couldn't parse ID")
+        else:
+            tickets_needing_docs.append(ticket)
+            print(f"    Needs new doc")
+
+    if not tickets_needing_docs and not tickets_with_docs:
+        print("No assigned non-closed tickets found.")
+        sys.exit(0)
+
+    if not tickets_needing_docs:
+        print("All tickets already have support docs.")
+        # Still process tagged note injection for existing docs
+        if tickets_with_docs:
+            _inject_all_tagged_notes(tickets_with_docs, conversations_cache, style, auto_confirm, dry_run)
+        sys.exit(0)
+
+    print(f"\n{len(tickets_needing_docs)} ticket(s) need new support docs")
+
+    # Step 3 & 4: Look up requesters and resolve CRM entities
+    # Fetch CRM data once for all tickets
+    print("\nFetching CRM contacts and companies...")
+    stdout, _, _ = run_cmd([CRM_SAFE, "contacts", "list"])
+    try:
+        contacts_cache = json.loads(stdout)
+    except json.JSONDecodeError:
+        contacts_cache = []
+
+    stdout, _, _ = run_cmd([CRM_SAFE, "companies", "list"])
+    try:
+        companies_cache = json.loads(stdout)
+    except json.JSONDecodeError:
+        companies_cache = []
+
+    # Find Shared Drive early (needed for unmatched domain resolution)
+    drive_id = find_shared_drive()
+
+    ticket_context = []  # will hold enriched ticket info for processing
+    skipped_tickets = []
+
+    for ticket in tickets_needing_docs:
+        tid = ticket["freshdesk_ticket_id"]
+        requester_id = ticket.get("requester_id")
+
+        # Look up requester
+        print(f"\nProcessing ticket #{tid}: {ticket['subject']}")
+        contact = lookup_freshdesk_contact(requester_id) if requester_id else None
+        if not contact:
+            print(f"  WARNING: could not look up requester {requester_id}")
+            skipped_tickets.append({"ticket": ticket, "reason": "Could not look up requester"})
+            continue
+
+        email = contact.get("email", "")
+        requester_name = contact.get("name", "Unknown") or "Unknown"
+        first_name = contact.get("first_name", "") or ""
+        last_name = contact.get("last_name", "") or ""
+
+        if not email:
+            print(f"  WARNING: requester {requester_id} has no email")
+            skipped_tickets.append({"ticket": ticket, "reason": "Requester has no email"})
+            continue
+
+        # Resolve CRM entity
+        crm = resolve_crm_entity(email, contacts_cache, companies_cache)
+        company_id = crm["company_id"]
+        company_name = crm["company_name"]
+
+        if crm["matched_by"] == "not_found":
+            # Try to find folder in Shared Drive
+            domain = email.split("@", 1)[-1]
+            keyword = extract_domain_keyword(domain)
+            print(f"  No CRM match for {email}. Searching Drive for '{keyword}'...")
+
+            folders = search_drive_for_keyword(drive_id, keyword)
+
+            if len(folders) == 1:
+                folder_name, folder_id = folders[0]
+                if skip_unmatched:
+                    # Auto-use single match
+                    company_name = folder_name
+                    print(f"  Found folder: '{folder_name}' - using it")
+                else:
+                    # Prompt for confirmation
+                    print(f"  Found folder: '{folder_name}' - use this? [Y/n] ", end="", flush=True)
+                    try:
+                        answer = input().strip().lower()
+                    except EOFError:
+                        answer = "y"
+                    if answer in ("", "y", "yes"):
+                        company_name = folder_name
+                    else:
+                        print(f"  Skipping ticket #{tid}")
+                        skipped_tickets.append({"ticket": ticket, "reason": "User declined folder match"})
+                        continue
+            elif len(folders) > 1:
+                if skip_unmatched:
+                    print(f"  Multiple folders found, skipping (--skip-unmatched)")
+                    skipped_tickets.append({"ticket": ticket, "reason": f"Multiple folder matches: {[f[0] for f in folders]}"})
+                    continue
+                else:
+                    print(f"  Multiple folders found:")
+                    for i, (name, _) in enumerate(folders, 1):
+                        print(f"    {i}. {name}")
+                    print(f"  Enter number to choose (or 0 to skip): ", end="", flush=True)
+                    try:
+                        choice = input().strip()
+                    except EOFError:
+                        choice = "0"
+                    try:
+                        choice_num = int(choice)
+                    except ValueError:
+                        choice_num = 0
+                    if 1 <= choice_num <= len(folders):
+                        company_name = folders[choice_num - 1][0]
+                    else:
+                        print(f"  Skipping ticket #{tid}")
+                        skipped_tickets.append({"ticket": ticket, "reason": "User skipped folder selection"})
+                        continue
+            else:
+                # No folders found
+                if skip_unmatched:
+                    print(f"  No matching folder found, skipping (--skip-unmatched)")
+                    skipped_tickets.append({"ticket": ticket, "reason": f"No Drive folder found for domain {domain}"})
+                    continue
+                else:
+                    print(f"  No matching folder found for domain '{domain}'.")
+                    print(f"  Enter the folder name in the Customers Shared Drive (or empty to skip): ", end="", flush=True)
+                    try:
+                        folder_input = input().strip()
+                    except EOFError:
+                        folder_input = ""
+                    if folder_input:
+                        company_name = folder_input
+                    else:
+                        print(f"  Skipping ticket #{tid}")
+                        skipped_tickets.append({"ticket": ticket, "reason": "No folder specified"})
+                        continue
+
+            # Step 5: Create CRM company for unmatched domain
+            if company_name:
+                domain = email.split("@", 1)[-1]
+                print(f"  Creating CRM company '{company_name}' with domain '{domain}'...")
+                company_data = {"name": company_name, "domains": [domain]}
+                stdout, _, _ = run_cmd(
+                    [CRM_SAFE, "companies", "create", "--json", json.dumps(company_data)]
+                )
+                try:
+                    created = json.loads(stdout)
+                    company_id = created["id"]
+                    # Refresh companies cache
+                    companies_cache.append(created)
+                except (json.JSONDecodeError, KeyError):
+                    print(f"  WARNING: failed to create CRM company for {company_name}", file=sys.stderr)
+                    skipped_tickets.append({"ticket": ticket, "reason": "Failed to create CRM company"})
+                    continue
+
+        if not company_id or not company_name:
+            print(f"  WARNING: no CRM company resolved for ticket #{tid}")
+            skipped_tickets.append({"ticket": ticket, "reason": "No CRM company resolved"})
+            continue
+
+        print(f"  Company: {company_name} (CRM ID: {company_id})")
+
+        # Step 6: Ensure CRM records
+        requester_info = {
+            "email": email,
+            "name": requester_name,
+            "first_name": first_name,
+            "last_name": last_name,
+            "freshdesk_id": requester_id,
+        }
+        crm_records = ensure_crm_records(ticket, requester_info, company_id)
+        if crm_records["created_contact"]:
+            print(f"  Created CRM contact: {requester_name}")
+        if crm_records["created_ticket"]:
+            print(f"  Created CRM ticket for FD#{tid}")
+
+        ticket_context.append({
+            "ticket": ticket,
+            "email": email,
+            "requester_name": requester_name,
+            "company_id": company_id,
+            "company_name": company_name,
+            "crm_records": crm_records,
+        })
+
+    if not ticket_context:
+        print("\nNo tickets to process after resolution.")
+        if tickets_with_docs:
+            _inject_all_tagged_notes(tickets_with_docs, conversations_cache, style, auto_confirm, dry_run)
+        if skipped_tickets:
+            _report_skipped(skipped_tickets)
+        sys.exit(0)
+
+    # Step 7: Locate customer folders and support subfolders
+    folder_cache = {}  # company_name -> support_folder_id
+
+    for ctx in ticket_context:
+        company_name = ctx["company_name"]
+        if company_name in folder_cache:
+            ctx["support_folder_id"] = folder_cache[company_name]
+            continue
+
+        print(f"\nLocating folder for '{company_name}'...")
+        customer_folder = find_customer_folder(drive_id, company_name)
+        if not customer_folder:
+            print(f"  WARNING: no folder found for '{company_name}' in Shared Drive")
+            ctx["support_folder_id"] = None
+            continue
+
+        support_folder = find_support_subfolder(drive_id, customer_folder)
+        if not support_folder:
+            print(f"  Creating 'support' subfolder under '{company_name}'...")
+            if dry_run:
+                print(f"  [DRY RUN] Would create 'support' subfolder")
+                ctx["support_folder_id"] = None
+                continue
+            support_folder, success = create_support_subfolder(customer_folder, auto_confirm)
+            if not success:
+                print(f"  WARNING: failed to create support subfolder")
+                ctx["support_folder_id"] = None
+                continue
+            print(f"  Created support folder: {support_folder}")
+
+        folder_cache[company_name] = support_folder
+        ctx["support_folder_id"] = support_folder
+
+    # Remove tickets without folder resolution
+    processable = [ctx for ctx in ticket_context if ctx.get("support_folder_id")]
+    no_folder = [ctx for ctx in ticket_context if not ctx.get("support_folder_id")]
+    for ctx in no_folder:
+        skipped_tickets.append({
+            "ticket": ctx["ticket"],
+            "reason": f"No support folder for {ctx['company_name']}",
+        })
+
+    if not processable:
+        print("\nNo tickets can be processed (no folder resolution).")
+        if tickets_with_docs:
+            _inject_all_tagged_notes(tickets_with_docs, conversations_cache, style, auto_confirm, dry_run)
+        if skipped_tickets:
+            _report_skipped(skipped_tickets)
+        sys.exit(0)
+
+    # Step 8: Present summary
+    today_str = datetime.now().strftime("%Y%m%d")
+    print("\n" + "=" * 70)
+    print("Support Notes Summary")
+    print("=" * 70)
+    for ctx in processable:
+        t = ctx["ticket"]
+        tid = t["freshdesk_ticket_id"]
+        doc_name = f"{today_str}-{tid}-{slugify(t['subject'])}"
+        ctx["doc_name"] = doc_name
+        print(f"  Ticket #{tid}: {t['subject']}")
+        print(f"    Requestor: {ctx['requester_name']} ({ctx['email']})")
+        print(f"    Company:   {ctx['company_name']}")
+        print(f"    Doc name:  {doc_name}")
+        print(f"    Folder:    Customers > {ctx['company_name']} > support")
+        print()
+
+    if dry_run:
+        print("[DRY RUN] Would create the above documents.")
+        if tickets_with_docs:
+            print(f"\nWould also inject tagged notes for {len(tickets_with_docs)} existing doc(s).")
+        if skipped_tickets:
+            _report_skipped(skipped_tickets)
+        sys.exit(0)
+
+    # Step 9: Create support note documents
+    created_docs = []
+    failed_docs = []
+
+    for ctx in processable:
+        t = ctx["ticket"]
+        tid = t["freshdesk_ticket_id"]
+        doc_name = ctx["doc_name"]
+        support_folder_id = ctx["support_folder_id"]
+
+        print(f"\n--- Creating doc for ticket #{tid} ---")
+
+        # 9a: Create the Google Doc
+        doc_id, web_view_link, success = create_google_doc(
+            support_folder_id, doc_name, auto_confirm
+        )
+        if not success:
+            print(f"  FAILED to create doc for ticket #{tid}")
+            failed_docs.append({"ticket": t, "reason": "Doc creation failed"})
+            continue
+
+        print(f"  Created doc: {doc_id}")
+        print(f"  URL: {web_view_link}")
+
+        # 9b: Populate the doc
+        success = populate_doc(
+            doc_id, t, ctx["requester_name"], ctx["email"],
+            ctx["company_name"], style, auto_confirm,
+        )
+        if not success:
+            print(f"  FAILED to populate doc for ticket #{tid}")
+            failed_docs.append({"ticket": t, "reason": "Doc population failed", "doc_id": doc_id})
+            continue
+
+        # 9c: Add private note to FreshDesk
+        stdout, success = add_freshdesk_note(tid, web_view_link, auto_confirm)
+        if not success:
+            print(f"  FAILED to add FreshDesk note for ticket #{tid}")
+            failed_docs.append({"ticket": t, "reason": "FreshDesk note failed", "doc_id": doc_id})
+            continue
+
+        # 9d: Link in CRM
+        link_doc_in_crm(doc_id, doc_name, web_view_link, ctx["company_id"])
+        print(f"  Linked doc in CRM for company {ctx['company_name']}")
+
+        created_docs.append({
+            "ticket": t,
+            "doc_id": doc_id,
+            "web_view_link": web_view_link,
+            "company_name": ctx["company_name"],
+        })
+
+        # Add to tickets_with_docs for tagged note injection
+        tickets_with_docs.append({"ticket": t, "doc_id": doc_id})
+
+    # Step 9e: Inject tagged notes for ALL tickets with docs
+    injection_results = {}
+    if tickets_with_docs:
+        injection_results = _inject_all_tagged_notes(
+            tickets_with_docs, conversations_cache, style, auto_confirm, dry_run
+        )
+
+    # Step 10: Report results
+    print("\n" + "=" * 70)
+    print("Results")
+    print("=" * 70)
+
+    print(f"\nSupport notes created: {len(created_docs)}")
+    for d in created_docs:
+        t = d["ticket"]
+        print(f"  [{t['freshdesk_ticket_id']}] {t['subject']}")
+        print(f"    Company: {d['company_name']}")
+        print(f"    Doc: {d['web_view_link']}")
+
+    if injection_results:
+        total_injected = sum(r.get("injected_count", 0) for r in injection_results.values())
+        if total_injected:
+            print(f"\nTagged notes injected: {total_injected}")
+            for tid, r in injection_results.items():
+                if r["injected_count"] > 0:
+                    print(f"  Ticket #{tid}: {r['injected_count']} note(s)")
+        all_skipped_images = []
+        for tid, r in injection_results.items():
+            for img in r.get("skipped_images", []):
+                all_skipped_images.append((tid, img))
+        if all_skipped_images:
+            print(f"\nSkipped images: {len(all_skipped_images)}")
+            for tid, img in all_skipped_images:
+                print(f"  Ticket #{tid}: {img}")
+
+    if failed_docs:
+        print(f"\nFailed: {len(failed_docs)}")
+        for f in failed_docs:
+            t = f["ticket"]
+            print(f"  [{t['freshdesk_ticket_id']}] {t['subject']}: {f['reason']}")
+
+    if skipped_tickets:
+        _report_skipped(skipped_tickets)
+
+    # Exit with error if anything failed
+    if failed_docs:
+        sys.exit(1)
+
+
+def _inject_all_tagged_notes(tickets_with_docs, conversations_cache, style, auto_confirm, dry_run):
+    """Inject support-bot tagged notes for all tickets that have docs.
+
+    Returns dict of ticket_id -> injection result.
+    """
+    if dry_run:
+        print(f"\n[DRY RUN] Would inject tagged notes for {len(tickets_with_docs)} ticket(s)")
+        return {}
+
+    results = {}
+    for entry in tickets_with_docs:
+        t = entry["ticket"]
+        doc_id = entry.get("doc_id")
+        if not doc_id:
+            continue
+
+        tid = t["freshdesk_ticket_id"]
+
+        # Get conversations (use cache if available)
+        if tid in conversations_cache:
+            conversations = conversations_cache[tid]
+        else:
+            # Fetch conversations
+            stdout, _, _ = run_cmd(
+                [FRESHDESK_SAFE, "tickets", "view", str(tid), "--include", "conversations"]
+            )
+            try:
+                data = json.loads(stdout)
+                conversations = data.get("conversations", [])
+            except json.JSONDecodeError:
+                conversations = []
+            conversations_cache[tid] = conversations
+
+        result = inject_tagged_notes(tid, doc_id, conversations, style, auto_confirm)
+        if result["injected_count"] > 0 or result["errors"]:
+            results[tid] = result
+
+    return results
+
+
+def _report_skipped(skipped_tickets):
+    """Report skipped tickets."""
+    print(f"\nSkipped: {len(skipped_tickets)}")
+    for s in skipped_tickets:
+        t = s["ticket"]
+        print(f"  [{t['freshdesk_ticket_id']}] {t['subject']}: {s['reason']}")
+
+
+if __name__ == "__main__":
+    main()

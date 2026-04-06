@@ -27,7 +27,8 @@ CREATE TABLE sections (
     id              INTEGER PRIMARY KEY,
     entry_id        INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
     section_type    TEXT NOT NULL CHECK (section_type IN (
-                        'task_list', 'open_tickets', 'thoughts_ideas', 'notes'
+                        'task_list', 'open_tickets', 'random_fact',
+                        'thoughts_ideas', 'notes'
                     )),
     heading_text    TEXT NOT NULL,
     start_index     INTEGER NOT NULL,

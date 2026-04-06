@@ -422,91 +422,22 @@ def build_archive_batch_update(full_text, paragraphs, rich_links, images, person
     total_len = utf16_len(full_text)
     text_end = base_index + total_len
 
+    # Google Docs requires endIndex to be strictly less than the segment end.
+    # After inserting text at index 1, the segment end is at least text_end + 1
+    # (the original trailing newline shifts past the inserted content), so
+    # text_end is always a valid upper bound for styling ranges.
+    para_range_end = text_end
+
     # 2. Reset everything to NORMAL_TEXT
     requests.append({
         "updateParagraphStyle": {
-            "range": {"startIndex": base_index, "endIndex": text_end, "tabId": tab_id},
+            "range": {"startIndex": base_index, "endIndex": para_range_end, "tabId": tab_id},
             "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
             "fields": "namedStyleType",
         }
     })
 
-    # 3. Walk paragraphs and build formatting requests
-    heading_ranges = []
-    normal_ranges = []
-    default_bullet_ranges = []
-    checkbox_bullet_ranges = []
-
-    # Split text into lines to track positions accurately
-    # Each paragraph's text includes its trailing \n
-    cursor = base_index
-    for para in paragraphs:
-        para_text = para["text"]
-        para_start = cursor
-        para_end = cursor + utf16_len(para_text)
-        style_type = para["named_style"]
-
-        if style_type in ("HEADING_1", "HEADING_2", "HEADING_3"):
-            requests.append({
-                "updateParagraphStyle": {
-                    "range": {"startIndex": para_start, "endIndex": para_end, "tabId": tab_id},
-                    "paragraphStyle": {"namedStyleType": style_type},
-                    "fields": "namedStyleType",
-                }
-            })
-            heading_ranges.append((para_start, para_end))
-        else:
-            normal_ranges.append((para_start, para_end))
-
-        # Track bullet ranges
-        if para["has_bullet"]:
-            if para["section_context"] == "open_tickets":
-                checkbox_bullet_ranges.append((para_start, para_end))
-            else:
-                default_bullet_ranges.append((para_start, para_end))
-
-        cursor = para_end
-
-    # 4. Apply bullets on contiguous ranges
-    if default_bullet_ranges:
-        for group_start, group_end in _merge_contiguous_ranges(default_bullet_ranges):
-            requests.append({
-                "createParagraphBullets": {
-                    "range": {"startIndex": group_start, "endIndex": group_end, "tabId": tab_id},
-                    "bulletPreset": style["bulletPresets"]["default"],
-                }
-            })
-
-    if checkbox_bullet_ranges:
-        for group_start, group_end in _merge_contiguous_ranges(checkbox_bullet_ranges):
-            requests.append({
-                "createParagraphBullets": {
-                    "range": {"startIndex": group_start, "endIndex": group_end, "tabId": tab_id},
-                    "bulletPreset": style["bulletPresets"]["checkbox"],
-                }
-            })
-
-    # 5. Font styling on headings
-    heading_text_style = {
-        "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
-    }
-    heading_fields = "weightedFontFamily"
-    if style["colors"].get("headingText"):
-        heading_text_style["foregroundColor"] = {
-            "color": {"rgbColor": style["colors"]["headingText"]}
-        }
-        heading_fields += ",foregroundColor"
-
-    for start, end in heading_ranges:
-        requests.append({
-            "updateTextStyle": {
-                "range": {"startIndex": start, "endIndex": end, "tabId": tab_id},
-                "textStyle": heading_text_style,
-                "fields": heading_fields,
-            }
-        })
-
-    # 6. Font styling on normal text
+    # 3. Apply body font to the entire insertion range, then override headings
     body_text_style = {
         "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
     }
@@ -517,12 +448,80 @@ def build_archive_batch_update(full_text, paragraphs, rich_links, images, person
         }
         body_fields += ",foregroundColor"
 
-    for start, end in normal_ranges:
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": base_index, "endIndex": para_range_end, "tabId": tab_id},
+            "textStyle": body_text_style,
+            "fields": body_fields,
+        }
+    })
+
+    # 4. Walk paragraphs and collect heading/bullet ranges
+    heading_ranges = []
+    default_bullet_ranges = []
+    checkbox_bullet_ranges = []
+
+    cursor = base_index
+    for para in paragraphs:
+        para_text = para["text"]
+        para_start = cursor
+        para_end = cursor + utf16_len(para_text)
+        style_type = para["named_style"]
+
+        if style_type in ("HEADING_1", "HEADING_2", "HEADING_3"):
+            requests.append({
+                "updateParagraphStyle": {
+                    "range": {"startIndex": para_start, "endIndex": min(para_end, para_range_end), "tabId": tab_id},
+                    "paragraphStyle": {"namedStyleType": style_type},
+                    "fields": "namedStyleType",
+                }
+            })
+            heading_ranges.append((para_start, para_end))
+
+        if para["has_bullet"]:
+            if para["section_context"] == "open_tickets":
+                checkbox_bullet_ranges.append((para_start, para_end))
+            else:
+                default_bullet_ranges.append((para_start, para_end))
+
+        cursor = para_end
+
+    # 5. Apply bullets on contiguous ranges
+    if default_bullet_ranges:
+        for group_start, group_end in _merge_contiguous_ranges(default_bullet_ranges):
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": group_start, "endIndex": min(group_end, para_range_end), "tabId": tab_id},
+                    "bulletPreset": style["bulletPresets"]["default"],
+                }
+            })
+
+    if checkbox_bullet_ranges:
+        for group_start, group_end in _merge_contiguous_ranges(checkbox_bullet_ranges):
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": group_start, "endIndex": min(group_end, para_range_end), "tabId": tab_id},
+                    "bulletPreset": style["bulletPresets"]["checkbox"],
+                }
+            })
+
+    # 6. Override heading ranges with heading font (merged contiguous)
+    heading_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
+    }
+    heading_fields = "weightedFontFamily"
+    if style["colors"].get("headingText"):
+        heading_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["headingText"]}
+        }
+        heading_fields += ",foregroundColor"
+
+    for start, end in _merge_contiguous_ranges(heading_ranges):
         requests.append({
             "updateTextStyle": {
-                "range": {"startIndex": start, "endIndex": end, "tabId": tab_id},
-                "textStyle": body_text_style,
-                "fields": body_fields,
+                "range": {"startIndex": start, "endIndex": min(end, para_range_end), "tabId": tab_id},
+                "textStyle": heading_text_style,
+                "fields": heading_fields,
             }
         })
 
@@ -532,7 +531,7 @@ def build_archive_batch_update(full_text, paragraphs, rich_links, images, person
             "updateTextStyle": {
                 "range": {
                     "startIndex": base_index + rl_start,
-                    "endIndex": base_index + rl_end,
+                    "endIndex": min(base_index + rl_end, para_range_end),
                     "tabId": tab_id,
                 },
                 "textStyle": {"link": {"url": uri}},
@@ -659,7 +658,9 @@ def main():
     # Step 6: Create missing tabs
     ensure_tabs_exist(archive_doc_id, entries_by_week, tab_map, auto_confirm)
 
-    # Step 7: For each week tab, extract entries and build/execute archive batchUpdate
+    # Step 7: For each week tab, archive entries one at a time.
+    # Each entry is inserted at index 1, pushing previous content down.
+    # Insert oldest-first so the newest entry ends up on top.
     for key in sorted(entries_by_week.keys()):
         year_title, quarter_title, week_title = key
         group = entries_by_week[key]
@@ -669,63 +670,44 @@ def main():
             print(f"ERROR: week tab '{week_title}' not found after creation", file=sys.stderr)
             sys.exit(1)
 
-        # Sort entries oldest-first so they appear in chronological order
-        # (top to bottom) within the tab. New batches inserted at index 1
-        # push older content down, keeping recent entries near the top.
         week_entries = sorted(group["entries"], key=lambda e: e["entry_date"])
 
-        all_text_parts = []
-        all_paragraphs = []
-        all_rich_links = []
-        all_images = []
-        all_persons = []
+        print(f"\nArchiving to {year_title} > {quarter_title} > {week_title}...")
+        print(f"  {len(week_entries)} entry/entries")
 
         for entry in week_entries:
             text, paragraphs, rich_links, images_list, persons_list = extract_entry_for_archive(
                 doc, entry["start_index"], entry["end_index"]
             )
 
-            # Offset all positions by the cumulative text length so far
-            offset = utf16_len("".join(all_text_parts))
+            print(f"  Archiving {entry['heading_text']} ({utf16_len(text)} characters)...")
 
-            for para in paragraphs:
-                para["archive_start"] += offset
-            all_paragraphs.extend(paragraphs)
+            batch = build_archive_batch_update(
+                text, paragraphs, rich_links, images_list, persons_list, tab_id, style
+            )
 
-            adjusted_rich_links = [(s + offset, e + offset, uri) for s, e, uri in rich_links]
-            all_rich_links.extend(adjusted_rich_links)
-
-            adjusted_images = [(pos + offset, uri, h, w) for pos, uri, h, w in images_list]
-            all_images.extend(adjusted_images)
-
-            adjusted_persons = [(pos + offset, email) for pos, email in persons_list]
-            all_persons.extend(adjusted_persons)
-
-            all_text_parts.append(text)
-
-        full_text = "".join(all_text_parts)
-
-        print(f"\nArchiving to {year_title} > {quarter_title} > {week_title}...")
-        print(f"  {len(week_entries)} entry/entries, {utf16_len(full_text)} characters")
-
-        batch = build_archive_batch_update(
-            full_text, all_paragraphs, all_rich_links, all_images, all_persons, tab_id, style
-        )
-
-        success = execute_batch_update(archive_doc_id, batch, auto_confirm)
-        if not success:
-            sys.exit(2)
+            success = execute_batch_update(archive_doc_id, batch, auto_confirm)
+            if not success:
+                sys.exit(2)
 
     # Step 8: Delete archived entries from main document (bottom-to-top)
     print("\nDeleting archived entries from main document...")
+    body_content = doc.get("body", {}).get("content", [])
+    doc_end = body_content[-1].get("endIndex", 0) if body_content else 0
+
     entries_to_delete = sorted(old_entries, key=lambda e: e["start_index"], reverse=True)
     delete_requests = []
     for entry in entries_to_delete:
+        end_index = entry["end_index"]
+        # The API forbids including the final newline of the segment.
+        # If this entry spans to the document end, back off by 1.
+        if end_index >= doc_end:
+            end_index = doc_end - 1
         delete_requests.append({
             "deleteContentRange": {
                 "range": {
                     "startIndex": entry["start_index"],
-                    "endIndex": entry["end_index"],
+                    "endIndex": end_index,
                 }
             }
         })

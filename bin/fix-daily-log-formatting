@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""One-off fix script for two formatting issues in today's daily log entry.
+
+Issue 1: Random Fact content paragraph is HEADING_2 instead of NORMAL_TEXT
+Issue 2: Priorities items have disc bullets instead of checkbox bullets
+
+Applies both fixes in separate passes (re-fetching the doc between each
+to avoid index drift).
+
+Usage:
+    bin/fix-daily-log-formatting [--auto-confirm]
+"""
+
+import argparse
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    execute_batch_update,
+    fetch_doc,
+    read_configs,
+    update_cache,
+)
+
+
+# --- Helpers ---
+
+
+def find_entry_bounds(body_content, today_heading):
+    """Find today's entry start and end indices."""
+    entry_start = None
+    entry_end = None
+    for element in body_content:
+        paragraph = element.get("paragraph", {})
+        pstyle = paragraph.get("paragraphStyle", {})
+        if pstyle.get("namedStyleType") == "HEADING_1":
+            text = ""
+            for pe in paragraph.get("elements", []):
+                text += pe.get("textRun", {}).get("content", "")
+            if text.strip() == today_heading:
+                entry_start = element.get("startIndex", 0)
+                entry_end = body_content[-1].get("endIndex", 0)
+                for el2 in body_content:
+                    el2_start = el2.get("startIndex", 0)
+                    if el2_start <= entry_start:
+                        continue
+                    p2 = el2.get("paragraph", {})
+                    ps2 = p2.get("paragraphStyle", {})
+                    if ps2.get("namedStyleType") == "HEADING_1":
+                        entry_end = el2_start
+                        break
+                break
+    return entry_start, entry_end
+
+
+def find_heading2(body_content, entry_start, entry_end, heading_text):
+    """Find a HEADING_2 paragraph matching heading_text exactly.
+    Returns (start_index, end_index) or None."""
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        if el_start < entry_start or el_start >= entry_end:
+            continue
+        paragraph = element.get("paragraph", {})
+        pstyle = paragraph.get("paragraphStyle", {})
+        if pstyle.get("namedStyleType") != "HEADING_2":
+            continue
+        text = ""
+        for pe in paragraph.get("elements", []):
+            text += pe.get("textRun", {}).get("content", "")
+        if text.strip() == heading_text:
+            return el_start, element.get("endIndex", 0)
+    return None
+
+
+# --- Pass 1: Fix Random Fact content paragraph style ---
+
+
+def pass_fix_random_fact(doc_id, style, auto_confirm):
+    """Set Random Fact content paragraph to NORMAL_TEXT with body font."""
+    print("\n=== Pass 1: Fix Random Fact content paragraph style ===")
+    doc = fetch_doc(doc_id)
+    body_content = doc.get("body", {}).get("content", [])
+    today_heading = datetime.now().strftime("%A %b %-d, %Y")
+    entry_start, entry_end = find_entry_bounds(body_content, today_heading)
+    if entry_start is None:
+        print(f"ERROR: Could not find today's entry ({today_heading})", file=sys.stderr)
+        sys.exit(1)
+
+    rf_h2 = find_heading2(body_content, entry_start, entry_end, "Random Fact:")
+    if not rf_h2:
+        print("  Random Fact heading not found")
+        return False
+
+    rf_heading_start, rf_heading_end = rf_h2
+
+    # Find the next element after the heading -- that's the fact content
+    fact_element = None
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        if el_start >= rf_heading_end and el_start < entry_end:
+            fact_element = element
+            break
+
+    if not fact_element:
+        print("  No content paragraph found after Random Fact heading")
+        return False
+
+    fact_start = fact_element.get("startIndex", 0)
+    fact_end = fact_element.get("endIndex", 0)
+
+    # Check if it's already NORMAL_TEXT
+    fact_style = fact_element.get("paragraph", {}).get("paragraphStyle", {}).get("namedStyleType")
+    if fact_style == "NORMAL_TEXT":
+        print("  Random Fact content is already NORMAL_TEXT")
+        return False
+
+    print(f"  Fact content paragraph [{fact_start}-{fact_end}] is {fact_style}, changing to NORMAL_TEXT")
+
+    requests = []
+
+    # Set paragraph style to NORMAL_TEXT
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": fact_start, "endIndex": fact_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # Apply body font
+    body_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    body_fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        body_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        body_fields += ",foregroundColor"
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": fact_start, "endIndex": fact_end},
+            "textStyle": body_text_style,
+            "fields": body_fields,
+        }
+    })
+
+    batch = {"requests": requests}
+    return execute_batch_update(doc_id, batch, auto_confirm)
+
+
+# --- Pass 2: Fix priorities bullet style ---
+
+
+def pass_fix_priorities_bullets(doc_id, style, auto_confirm):
+    """Change priorities items from disc bullets to checkbox bullets."""
+    print("\n=== Pass 2: Fix priorities bullet style ===")
+    doc = fetch_doc(doc_id)
+    body_content = doc.get("body", {}).get("content", [])
+    today_heading = datetime.now().strftime("%A %b %-d, %Y")
+    entry_start, entry_end = find_entry_bounds(body_content, today_heading)
+    if entry_start is None:
+        print(f"ERROR: Could not find today's entry ({today_heading})", file=sys.stderr)
+        sys.exit(1)
+
+    # Find Task List section
+    tl_h2 = find_heading2(body_content, entry_start, entry_end, "Task List:")
+    if not tl_h2:
+        print("  Task List heading not found")
+        return False
+
+    tl_start, tl_end = tl_h2
+
+    # Find the Waiting / Blockers label to know where priorities end
+    waiting_start = None
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        if el_start < tl_end or el_start >= entry_end:
+            continue
+        paragraph = element.get("paragraph", {})
+        text = ""
+        for pe in paragraph.get("elements", []):
+            text += pe.get("textRun", {}).get("content", "")
+        if "\u23f3 Waiting / Blockers:" in text.strip():
+            waiting_start = el_start
+            break
+
+    if waiting_start is None:
+        print("  Waiting / Blockers label not found")
+        return False
+
+    # Find the first and last priority items (bulleted items between Priorities label and Waiting label)
+    first_priority = None
+    last_priority_end = None
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        el_end = element.get("endIndex", 0)
+        if el_start < tl_end or el_start >= waiting_start:
+            continue
+        paragraph = element.get("paragraph", {})
+        if paragraph.get("bullet"):
+            if first_priority is None:
+                first_priority = el_start
+            last_priority_end = el_end
+
+    if first_priority is None:
+        print("  No priority items found")
+        return False
+
+    print(f"  Priorities range: [{first_priority}-{last_priority_end}]")
+    print(f"  Applying BULLET_CHECKBOX preset")
+
+    requests = []
+
+    # Apply checkbox bullets to all priority items
+    requests.append({
+        "createParagraphBullets": {
+            "range": {
+                "startIndex": first_priority,
+                "endIndex": last_priority_end,
+            },
+            "bulletPreset": style["bulletPresets"]["checkbox"],
+        }
+    })
+
+    batch = {"requests": requests}
+    return execute_batch_update(doc_id, batch, auto_confirm)
+
+
+# --- Pass 3: Fix waiting/blockers bullet style ---
+
+
+def pass_fix_waiting_bullets(doc_id, style, auto_confirm):
+    """Change waiting/blockers items from disc bullets to checkbox bullets."""
+    print("\n=== Pass 3: Fix waiting/blockers bullet style ===")
+    doc = fetch_doc(doc_id)
+    body_content = doc.get("body", {}).get("content", [])
+    today_heading = datetime.now().strftime("%A %b %-d, %Y")
+    entry_start, entry_end = find_entry_bounds(body_content, today_heading)
+    if entry_start is None:
+        print(f"ERROR: Could not find today's entry ({today_heading})", file=sys.stderr)
+        sys.exit(1)
+
+    # Find the Waiting / Blockers label
+    waiting_label_start = None
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        if el_start < entry_start or el_start >= entry_end:
+            continue
+        paragraph = element.get("paragraph", {})
+        text = ""
+        for pe in paragraph.get("elements", []):
+            text += pe.get("textRun", {}).get("content", "")
+        if "\u23f3 Waiting / Blockers:" in text.strip():
+            waiting_label_start = element.get("endIndex", 0)
+            break
+
+    if waiting_label_start is None:
+        print("  Waiting / Blockers label not found")
+        return False
+
+    # Find the next HEADING_2 after the label to know where waiting items end
+    waiting_section_end = entry_end
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        if el_start <= waiting_label_start or el_start >= entry_end:
+            continue
+        paragraph = element.get("paragraph", {})
+        pstyle = paragraph.get("paragraphStyle", {})
+        if pstyle.get("namedStyleType") == "HEADING_2":
+            waiting_section_end = el_start
+            break
+
+    # Find bulleted items in the waiting range
+    first_waiting = None
+    last_waiting_end = None
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        el_end = element.get("endIndex", 0)
+        if el_start < waiting_label_start or el_start >= waiting_section_end:
+            continue
+        paragraph = element.get("paragraph", {})
+        if paragraph.get("bullet"):
+            if first_waiting is None:
+                first_waiting = el_start
+            last_waiting_end = el_end
+
+    if first_waiting is None:
+        print("  No waiting/blockers items found")
+        return False
+
+    print(f"  Waiting/Blockers range: [{first_waiting}-{last_waiting_end}]")
+    print(f"  Applying BULLET_CHECKBOX preset")
+
+    requests = []
+    requests.append({
+        "createParagraphBullets": {
+            "range": {
+                "startIndex": first_waiting,
+                "endIndex": last_waiting_end,
+            },
+            "bulletPreset": style["bulletPresets"]["checkbox"],
+        }
+    })
+
+    batch = {"requests": requests}
+    return execute_batch_update(doc_id, batch, auto_confirm)
+
+
+# --- Main ---
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="One-off fix for daily log formatting issues"
+    )
+    parser.add_argument(
+        "--auto-confirm",
+        action="store_true",
+        help="Automatically confirm each batchUpdate write",
+    )
+    args = parser.parse_args()
+
+    config, style = read_configs()
+    doc_id = config["documentId"]
+
+    any_changes = False
+
+    result = pass_fix_random_fact(doc_id, style, args.auto_confirm)
+    if result:
+        any_changes = True
+
+    result = pass_fix_priorities_bullets(doc_id, style, args.auto_confirm)
+    if result:
+        any_changes = True
+
+    result = pass_fix_waiting_bullets(doc_id, style, args.auto_confirm)
+    if result:
+        any_changes = True
+
+    if any_changes:
+        update_cache(doc_id)
+        print("\nFix complete. Cache updated.")
+    else:
+        print("\nNo changes were needed.")
+
+
+if __name__ == "__main__":
+    main()

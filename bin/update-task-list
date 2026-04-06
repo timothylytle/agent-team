@@ -81,7 +81,8 @@ from lib.daily_log_utils import fetch_doc  # noqa: E402
 
 
 def extract_heading3_titles(doc, section_start, section_end):
-    """Extract HEADING_3 titles from a section of the doc (live, not cached)."""
+    """Extract HEADING_3 titles from a section of the doc (live, not cached).
+    Strips trailing [event] or [task] link labels for dedup matching."""
     titles = set()
     body_content = doc.get("body", {}).get("content", [])
     for element in body_content:
@@ -94,7 +95,10 @@ def extract_heading3_titles(doc, section_start, section_end):
             text = ""
             for pe in paragraph.get("elements", []):
                 text += pe.get("textRun", {}).get("content", "")
-            titles.add(text.strip())
+            title = text.strip()
+            # Strip trailing [event] or [task] link labels
+            title = re.sub(r"\s+\[(event|task)\]$", "", title)
+            titles.add(title)
     return titles
 
 
@@ -128,27 +132,8 @@ def find_subsection_boundary(doc, section_start, section_end, label_text):
     if found_label_start is None:
         return None
 
-    # Find the end of the content: the next sub-section label or section end
-    # Sub-section labels that mark the end of waiting/blockers content
-    end_labels = ["\U0001f3b2 Random Fact:"]
+    # Waiting/blockers content extends to the section end
     content_end = section_end
-
-    for element in body_content:
-        el_start = element.get("startIndex", 0)
-        el_end = element.get("endIndex", 0)
-        if el_start <= (found_content_start or found_label_start) or el_start >= section_end:
-            continue
-        paragraph = element.get("paragraph", {})
-        text = ""
-        for pe in paragraph.get("elements", []):
-            text += pe.get("textRun", {}).get("content", "")
-        text_stripped = text.strip()
-        for end_label in end_labels:
-            if end_label in text_stripped:
-                content_end = el_start
-                break
-        if content_end != section_end:
-            break
 
     return (found_label_start, found_content_start or found_label_start, content_end)
 
@@ -249,24 +234,44 @@ def build_batch_update(
     # --- Notes HEADING_3 sub-sections ---
     if new_notes_entries:
         notes_text = ""
+        notes_link_info = []  # (offset_of_label_start, offset_of_label_end, url)
         for item, item_type in new_notes_entries:
             title = item["summary"] if item_type == "event" else item["title"]
-            notes_text += f"{title}\n"
-            # Link line
             if item_type == "event":
                 link_url = item.get("support_doc_url") or item.get("html_link", "")
+                link_label = "[event]"
             else:
                 link_url = item.get("web_view_link", "")
+                link_label = "[task]"
+
             if link_url:
-                notes_text += f"{link_url}\n"
+                heading_text = f"{title} {link_label}"
+                label_offset = utf16_len(notes_text) + utf16_len(title + " ")
+                label_end_offset = label_offset + utf16_len(link_label)
+                notes_link_info.append((label_offset, label_end_offset, link_url))
+            else:
+                heading_text = title
+            notes_text += f"{heading_text}\n"
 
         def notes_formatting(base_index, text):
             reqs = []
             offset = 0
             for item, item_type in new_notes_entries:
                 title = item["summary"] if item_type == "event" else item["title"]
+                if item_type == "event":
+                    link_url = item.get("support_doc_url") or item.get("html_link", "")
+                    link_label = "[event]"
+                else:
+                    link_url = item.get("web_view_link", "")
+                    link_label = "[task]"
+
+                if link_url:
+                    heading_line = f"{title} {link_label}"
+                else:
+                    heading_line = title
+
                 heading_start = base_index + offset
-                heading_end = heading_start + utf16_len(title + "\n")
+                heading_end = heading_start + utf16_len(heading_line + "\n")
 
                 # HEADING_3 paragraph style
                 reqs.append(
@@ -307,61 +312,22 @@ def build_batch_update(
                     }
                 )
 
-                offset += utf16_len(title + "\n")
+                offset += utf16_len(heading_line + "\n")
 
-                # Link line
-                if item_type == "event":
-                    link_url = item.get("support_doc_url") or item.get(
-                        "html_link", ""
-                    )
-                else:
-                    link_url = item.get("web_view_link", "")
-
-                if link_url:
-                    link_start = base_index + offset
-                    link_text_end = link_start + utf16_len(link_url)
-                    link_line_end = link_start + utf16_len(link_url + "\n")
-
-                    # Body font on link line
-                    body_text_style = {
-                        "weightedFontFamily": {
-                            "fontFamily": style["fonts"]["body"],
+            # Apply inline links on [event]/[task] labels
+            for label_offset, label_end_offset, link_url in notes_link_info:
+                reqs.append(
+                    {
+                        "updateTextStyle": {
+                            "range": {
+                                "startIndex": base_index + label_offset,
+                                "endIndex": base_index + label_end_offset,
+                            },
+                            "textStyle": {"link": {"url": link_url}},
+                            "fields": "link",
                         }
                     }
-                    body_fields = "weightedFontFamily"
-                    if style["colors"].get("bodyText"):
-                        body_text_style["foregroundColor"] = {
-                            "color": {"rgbColor": style["colors"]["bodyText"]}
-                        }
-                        body_fields += ",foregroundColor"
-                    reqs.append(
-                        {
-                            "updateTextStyle": {
-                                "range": {
-                                    "startIndex": link_start,
-                                    "endIndex": link_line_end,
-                                },
-                                "textStyle": body_text_style,
-                                "fields": body_fields,
-                            }
-                        }
-                    )
-
-                    # Apply link on URL text (excluding trailing newline)
-                    reqs.append(
-                        {
-                            "updateTextStyle": {
-                                "range": {
-                                    "startIndex": link_start,
-                                    "endIndex": link_text_end,
-                                },
-                                "textStyle": {"link": {"url": link_url}},
-                                "fields": "link",
-                            }
-                        }
-                    )
-
-                    offset += utf16_len(link_url + "\n")
+                )
 
             return reqs
 
@@ -369,7 +335,7 @@ def build_batch_update(
 
     # --- Waiting / Blockers content ---
     # We need to handle the waiting/blockers section. The approach:
-    # - If there's existing content between "Waiting / Blockers:" and "Random Fact:",
+    # - If there's existing content after "Waiting / Blockers:",
     #   delete it and re-insert fresh content.
     # - This keeps it idempotent: the waiting/blockers always reflects current state.
     if waiting_boundary:
@@ -403,7 +369,7 @@ def build_batch_update(
                                 "startIndex": base_index,
                                 "endIndex": text_end,
                             },
-                            "bulletPreset": style["bulletPresets"]["default"],
+                            "bulletPreset": style["bulletPresets"]["checkbox"],
                         }
                     }
                 )
@@ -459,7 +425,7 @@ def build_batch_update(
             reqs = []
             text_end = base_index + utf16_len(text)
 
-            # Bullet the priority items
+            # Bullet the priority items with checkbox preset
             reqs.append(
                 {
                     "createParagraphBullets": {
@@ -467,7 +433,7 @@ def build_batch_update(
                             "startIndex": base_index,
                             "endIndex": text_end,
                         },
-                        "bulletPreset": style["bulletPresets"]["default"],
+                        "bulletPreset": style["bulletPresets"]["checkbox"],
                     }
                 }
             )

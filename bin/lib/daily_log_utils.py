@@ -37,10 +37,11 @@ SUPPORT_DOC_RE = re.compile(
 CACHE_TTL_SECONDS = 300  # 5 minutes
 
 SECTION_MAP = {
-    "Task List": "task_list",
+    "Task List:": "task_list",
     "Open Tickets:": "open_tickets",
+    "Random Fact:": "random_fact",
     "Thoughts / Ideas:": "thoughts_ideas",
-    "Notes": "notes",
+    "Notes:": "notes",
 }
 
 

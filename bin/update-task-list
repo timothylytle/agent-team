@@ -360,6 +360,15 @@ def build_batch_update(
             reqs = []
             text_end = base_index + utf16_len(text)
 
+            # Reset paragraph style to NORMAL_TEXT
+            reqs.append({
+                "updateParagraphStyle": {
+                    "range": {"startIndex": base_index, "endIndex": text_end},
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "fields": "namedStyleType",
+                }
+            })
+
             # Bullet the waiting items (if not "None")
             if waiting_lines != ["None"]:
                 reqs.append(
@@ -424,6 +433,15 @@ def build_batch_update(
         def priority_formatting(base_index, text):
             reqs = []
             text_end = base_index + utf16_len(text)
+
+            # Reset paragraph style to NORMAL_TEXT (prevents inheriting HEADING_2)
+            reqs.append({
+                "updateParagraphStyle": {
+                    "range": {"startIndex": base_index, "endIndex": text_end},
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "fields": "namedStyleType",
+                }
+            })
 
             # Bullet the priority items with checkbox preset
             reqs.append(

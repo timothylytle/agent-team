@@ -98,11 +98,22 @@ def build_batch_update(new_tickets, section_end, style):
         }
     })
 
-    # 2. Apply checkbox bullets to the inserted lines
-    # After insertion, the text occupies [insert_index, insert_index + len(insert_text))
+    # 2. Reset paragraph style to NORMAL_TEXT (prevents inheriting HEADING_2 from section boundary)
     text_start = insert_index
     text_end = insert_index + utf16_len(insert_text)
 
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": text_start,
+                "endIndex": text_end,
+            },
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Apply checkbox bullets to the inserted lines
     requests.append({
         "createParagraphBullets": {
             "range": {

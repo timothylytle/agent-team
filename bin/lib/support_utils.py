@@ -45,7 +45,7 @@ def read_style_config():
 def fetch_active_tickets():
     """Fetch all non-closed, agent-assigned FreshDesk tickets.
 
-    Uses the open_tickets_snapshot cache with a 5-min TTL to avoid
+    Uses the active_tickets_cache table with a 5-min TTL to avoid
     redundant FreshDesk API calls when scripts run in sequence.
     Returns a list of ticket dicts.
     """
@@ -53,7 +53,7 @@ def fetch_active_tickets():
 
     # Check cache freshness
     row = db.execute(
-        "SELECT MIN(fetched_at) as oldest FROM open_tickets_snapshot"
+        "SELECT MIN(fetched_at) as oldest FROM active_tickets_cache"
     ).fetchone()
     if row and row["oldest"]:
         oldest = datetime.fromisoformat(row["oldest"].replace("Z", "+00:00"))
@@ -63,7 +63,7 @@ def fetch_active_tickets():
             cached = db.execute(
                 "SELECT freshdesk_ticket_id, subject, requester_id, requester_name, "
                 "status, priority "
-                "FROM open_tickets_snapshot WHERE freshdesk_ticket_id != -1"
+                "FROM active_tickets_cache WHERE freshdesk_ticket_id != -1"
             ).fetchall()
             db.close()
             return [dict(r) for r in cached]
@@ -91,9 +91,9 @@ def fetch_active_tickets():
         # Store sentinel row for cache
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         db = get_cache_db()
-        db.execute("DELETE FROM open_tickets_snapshot")
+        db.execute("DELETE FROM active_tickets_cache")
         db.execute(
-            "INSERT INTO open_tickets_snapshot "
+            "INSERT INTO active_tickets_cache "
             "(freshdesk_ticket_id, subject, requester_id, requester_name, "
             "status, priority, fetched_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -117,12 +117,12 @@ def fetch_active_tickets():
             "fetched_at": now_iso,
         })
 
-    # Update snapshot cache
+    # Update cache
     db = get_cache_db()
-    db.execute("DELETE FROM open_tickets_snapshot")
+    db.execute("DELETE FROM active_tickets_cache")
     for t in tickets:
         db.execute(
-            "INSERT INTO open_tickets_snapshot "
+            "INSERT INTO active_tickets_cache "
             "(freshdesk_ticket_id, subject, requester_id, requester_name, "
             "status, priority, fetched_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",

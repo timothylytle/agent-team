@@ -306,10 +306,19 @@ def process_event(event, active_tickets, contacts_cache, companies_cache,
                     break
             # If not in active list, create a minimal reference
             if not matched_fd_ticket and matched_fd_ticket_id:
+                # crm_ticket["requester_id"] is a CRM contact ID, not a
+                # FreshDesk contact ID.  Resolve it via the contacts cache.
+                fd_requester_id = None
+                crm_requester_id = crm_ticket.get("requester_id")
+                if crm_requester_id is not None:
+                    for c in contacts_cache:
+                        if c.get("id") == crm_requester_id:
+                            fd_requester_id = c.get("freshdesk_id")
+                            break
                 matched_fd_ticket = {
                     "freshdesk_ticket_id": matched_fd_ticket_id,
                     "subject": crm_ticket.get("subject", ""),
-                    "requester_id": crm_ticket.get("requester_id"),
+                    "requester_id": fd_requester_id,
                     "status": crm_ticket.get("status"),
                     "priority": crm_ticket.get("priority"),
                 }
@@ -616,10 +625,6 @@ def main():
 
     # Step 2: Fetch active FreshDesk tickets
     active_tickets = fetch_active_tickets()
-    if not active_tickets:
-        print("No assigned non-closed tickets found.")
-        sys.exit(0)
-
     print(f"Found {len(active_tickets)} active ticket(s)")
 
     # Pre-fetch CRM contacts and companies for in-memory lookup

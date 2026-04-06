@@ -17,6 +17,7 @@ CREATE TABLE companies (
     domains         TEXT,                   -- JSON array of email domains, e.g. ["acme.com","acme.org"]
     health_score    TEXT,
     account_tier    TEXT,
+    vip             INTEGER DEFAULT 0 CHECK (vip IN (0, 1)),
     industry        TEXT,
     renewal_date    TEXT,                   -- ISO 8601
     custom_fields   TEXT,                   -- JSON object
@@ -161,3 +162,27 @@ CREATE TABLE meetings (
 
 CREATE INDEX idx_meetings_google_event_id ON meetings(google_event_id);
 CREATE INDEX idx_meetings_ticket_id ON meetings(ticket_id) WHERE ticket_id IS NOT NULL;
+
+-- ============================================================
+-- Emails
+-- Email records from the daily log's Email section. Linked to
+-- contacts and companies where the sender is known in the CRM.
+-- ============================================================
+CREATE TABLE emails (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    gmail_message_id    TEXT UNIQUE NOT NULL,
+    contact_id          INTEGER REFERENCES contacts(id),
+    company_id          INTEGER REFERENCES companies(id),
+    sender_email        TEXT NOT NULL,
+    sender_name         TEXT,
+    subject             TEXT,
+    gmail_url           TEXT,
+    received_at         TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_emails_gmail_message_id ON emails(gmail_message_id);
+CREATE INDEX idx_emails_contact_id ON emails(contact_id) WHERE contact_id IS NOT NULL;
+CREATE INDEX idx_emails_company_id ON emails(company_id) WHERE company_id IS NOT NULL;
+CREATE INDEX idx_emails_received_at ON emails(received_at) WHERE received_at IS NOT NULL;

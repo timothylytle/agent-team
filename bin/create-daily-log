@@ -53,7 +53,7 @@ def check_today_entry(doc_id, today_str):
 
 
 def run_update_path(auto_confirm):
-    """Run the two update sub-scripts in sequence."""
+    """Run the update sub-scripts in sequence."""
     print("\n--- Updating Task List ---")
     cmd = [str(REPO_ROOT / "bin" / "update-task-list")]
     if auto_confirm:
@@ -73,6 +73,17 @@ def run_update_path(auto_confirm):
     if result.returncode not in (0, 2):
         print(
             f"WARNING: update-open-tickets exited with code {result.returncode}",
+            file=sys.stderr,
+        )
+
+    print("\n--- Updating Email ---")
+    cmd = [str(REPO_ROOT / "bin" / "update-email")]
+    if auto_confirm:
+        cmd.append("--auto-confirm")
+    result = subprocess.run(cmd, text=True)
+    if result.returncode not in (0, 2):
+        print(
+            f"WARNING: update-email exited with code {result.returncode}",
             file=sys.stderr,
         )
 
@@ -140,6 +151,12 @@ def build_entry_text(today_heading, events, in_progress_tasks, waiting_tasks, ti
 
     # Fact text
     add_line(fact_text, "NORMAL_TEXT")
+
+    # Email heading
+    add_line("Email:", "HEADING_2")
+
+    # Empty line (populated by update-email script)
+    add_line("", "NORMAL_TEXT")
 
     # Thoughts / Ideas heading
     add_line("Thoughts / Ideas:", "HEADING_2")

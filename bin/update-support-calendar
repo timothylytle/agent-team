@@ -616,10 +616,6 @@ def main():
 
     # Step 2: Fetch active FreshDesk tickets
     active_tickets = fetch_active_tickets()
-    if not active_tickets:
-        print("No assigned non-closed tickets found.")
-        sys.exit(0)
-
     print(f"Found {len(active_tickets)} active ticket(s)")
 
     # Pre-fetch CRM contacts and companies for in-memory lookup

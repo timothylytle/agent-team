@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""Deterministic Support Calendar updater.
+
+Matches Google Calendar events to FreshDesk tickets, creates CRM meeting
+records, updates FreshDesk ticket notes with calendar event links, and
+updates calendar event descriptions with FreshDesk/Support Doc links.
+
+Replaces the LLM-orchestrated support-calendar skill with a direct Python
+implementation.
+
+Usage:
+    bin/update-support-calendar [--auto-confirm] [--dry-run]
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    CRM_SAFE,
+    FRESHDESK_TICKET_URL,
+    GWS_SAFE,
+    run_cmd,
+)
+from lib.support_utils import (
+    auto_confirm_freshdesk,
+    auto_confirm_gws,
+    ensure_crm_records,
+    fetch_active_tickets,
+    lookup_freshdesk_contact,
+    resolve_crm_entity,
+    scan_ticket_notes,
+)
+
+# --- Constants ---
+
+SUPPORT_COLOR_IDS = {"4", "11"}
+DEFAULT_SUMMARY_RE = re.compile(r"^\d+min Support Session \(.*\)$")
+FRESHDESK_LINK_MARKER = "miarec.freshdesk.com/a/tickets/"
+
+
+# --- Calendar event fetching ---
+
+
+def fetch_support_events():
+    """Fetch calendar events for the next 7 days, filtered to support colors.
+
+    Returns a list of raw event dicts from the GWS API.
+    """
+    now = datetime.now(timezone.utc)
+    time_min = now.strftime("%Y-%m-%dT00:00:00Z")
+    time_max = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
+
+    params = {
+        "calendarId": "primary",
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": True,
+        "orderBy": "startTime",
+    }
+
+    print("Fetching calendar events for next 7 days...")
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "calendar", "events", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse calendar events output", file=sys.stderr)
+        sys.exit(1)
+
+    items = data.get("items", [])
+    support_events = [e for e in items if e.get("colorId") in SUPPORT_COLOR_IDS]
+
+    print(f"  Found {len(support_events)} support-colored event(s) out of {len(items)} total")
+    return support_events
+
+
+# --- Attendee extraction ---
+
+
+def extract_attendee_emails(event):
+    """Extract non-self attendee emails from a calendar event."""
+    attendees = event.get("attendees", [])
+    return [
+        a["email"]
+        for a in attendees
+        if not a.get("self") and a.get("email")
+    ]
+
+
+# --- Ticket matching ---
+
+
+def match_ticket_for_company(company_id):
+    """Find the best CRM ticket for a company.
+
+    Priority: status 2 (Open) > status 9 (Scheduled) > most recently created.
+    Returns the best CRM ticket dict, or None.
+    """
+    stdout, _, _ = run_cmd(
+        [CRM_SAFE, "tickets", "list", "--company-id", str(company_id)]
+    )
+    try:
+        crm_tickets = json.loads(stdout)
+    except json.JSONDecodeError:
+        crm_tickets = []
+
+    if not crm_tickets:
+        return None
+
+    # Pick best ticket: prefer Open (2), then Scheduled (9), then any.
+    # Within same status group, prefer most recently created.
+    best = None
+    for status_pref in [2, 9]:
+        candidates = [t for t in crm_tickets if t.get("status") == status_pref]
+        if candidates:
+            candidates.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+            best = candidates[0]
+            break
+    if best is None:
+        crm_tickets.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+        best = crm_tickets[0]
+
+    return best
+
+
+def match_fd_ticket_by_domain(domain, active_tickets, contact_cache):
+    """Find a FreshDesk ticket whose requester's email domain matches.
+
+    Args:
+        domain: The attendee's email domain to match against.
+        active_tickets: List of active FreshDesk ticket dicts.
+        contact_cache: Dict of requester_id -> contact dict (or None if not yet fetched).
+            Updated in place with newly fetched contacts.
+
+    Returns:
+        The matching ticket dict, or None.
+    """
+    # Collect unique requester IDs
+    requester_ids = set()
+    for t in active_tickets:
+        rid = t.get("requester_id")
+        if rid:
+            requester_ids.add(rid)
+
+    for rid in requester_ids:
+        # Check cache first
+        if rid not in contact_cache:
+            contact = lookup_freshdesk_contact(rid)
+            contact_cache[rid] = contact
+
+        contact = contact_cache[rid]
+        if not contact:
+            continue
+
+        contact_email = (contact.get("email") or "").lower()
+        if "@" in contact_email:
+            contact_domain = contact_email.split("@", 1)[1]
+            if contact_domain == domain:
+                # Find the ticket(s) with this requester
+                for t in active_tickets:
+                    if t.get("requester_id") == rid:
+                        return t
+    return None
+
+
+# --- Note body formatting ---
+
+
+def format_event_date(event):
+    """Format event start date as 'Mon D' (e.g., 'Mar 31')."""
+    start = event.get("start", {})
+    dt_str = start.get("dateTime") or start.get("date", "")
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        return dt.strftime("%b %-d")
+    except (ValueError, TypeError):
+        return "Unknown"
+
+
+def build_note_body(existing_body, event_date_str, event_html_link):
+    """Build the updated FreshDesk note body with the calendar event line.
+
+    Works with HTML directly to preserve existing formatting and links.
+    If existing_body has content, preserve it and append the new calendar
+    event line. Otherwise create a new body with just the calendar event.
+    """
+    new_line = f'Calendar event {event_date_str}: <a href="{event_html_link}">{event_html_link}</a>'
+
+    if not existing_body:
+        return new_line
+
+    # Check if this event link is already in the body (search HTML directly)
+    if event_html_link in existing_body:
+        return None  # Already present, no update needed
+
+    # Append new calendar event line to existing HTML body
+    closing_div = existing_body.rfind("</div>")
+    if closing_div != -1:
+        return existing_body[:closing_div] + "<br>" + new_line + existing_body[closing_div:]
+    return existing_body.rstrip() + "<br>" + new_line
+
+
+# --- Calendar event description formatting ---
+
+
+def build_event_description(event, freshdesk_ticket_id, support_doc_url):
+    """Build updated event description with FreshDesk and Support Doc links.
+
+    Returns the new description, or None if no update is needed.
+    """
+    existing = event.get("description", "") or ""
+
+    # Already processed - skip
+    if FRESHDESK_LINK_MARKER in existing:
+        return None
+
+    fd_url = FRESHDESK_TICKET_URL.format(freshdesk_ticket_id)
+    lines = [f"FreshDesk: {fd_url}"]
+    if support_doc_url:
+        lines.append(f"Support Doc: {support_doc_url}")
+
+    prefix = "\n".join(lines)
+    if existing.strip():
+        return prefix + "\n\n" + existing
+    return prefix
+
+
+def build_event_summary(event, company_name, freshdesk_ticket_id, ticket_subject):
+    """Build updated event summary if it matches the default pattern.
+
+    Returns the new summary, or None if no update is needed.
+    """
+    current = event.get("summary", "")
+    if DEFAULT_SUMMARY_RE.match(current):
+        return f"{company_name} | miarec - [{freshdesk_ticket_id}] - {ticket_subject}"
+    return None
+
+
+# --- Main processing ---
+
+
+def process_event(event, active_tickets, contacts_cache, companies_cache,
+                  fd_contact_cache, auto_confirm, dry_run):
+    """Process a single support calendar event.
+
+    Returns a result dict describing what was done, or None on error.
+    """
+    event_id = event.get("id", "")
+    summary = event.get("summary", "(No title)")
+    html_link = event.get("htmlLink", "")
+    color_id = event.get("colorId", "")
+
+    result = {
+        "event_id": event_id,
+        "summary": summary,
+        "matched": False,
+        "company_name": None,
+        "freshdesk_ticket_id": None,
+        "actions": [],
+        "errors": [],
+    }
+
+    # Step 3.1: Extract attendee emails
+    attendee_emails = extract_attendee_emails(event)
+    if not attendee_emails:
+        result["errors"].append("No non-self attendees found")
+        return result
+
+    # Step 3.2: Resolve CRM entities for each attendee
+    resolved = None
+    for email in attendee_emails:
+        r = resolve_crm_entity(email, contacts_cache, companies_cache)
+        if r["matched_by"] != "not_found":
+            resolved = r
+            resolved["email"] = email
+            break
+        # Keep first resolution for domain fallback
+        if resolved is None:
+            resolved = r
+            resolved["email"] = email
+
+    company_id = resolved.get("company_id")
+    company_name = resolved.get("company_name")
+
+    # Step 3.3/3.4: Find matching ticket
+    matched_fd_ticket = None
+    crm_ticket = None
+
+    if resolved["matched_by"] in ("contact", "domain"):
+        # Have a company - find CRM tickets for it
+        crm_ticket = match_ticket_for_company(company_id)
+        if crm_ticket:
+            matched_fd_ticket_id = crm_ticket.get("freshdesk_id")
+            # Find the corresponding FreshDesk ticket from active list
+            for t in active_tickets:
+                if t["freshdesk_ticket_id"] == matched_fd_ticket_id:
+                    matched_fd_ticket = t
+                    break
+            # If not in active list, create a minimal reference
+            if not matched_fd_ticket and matched_fd_ticket_id:
+                matched_fd_ticket = {
+                    "freshdesk_ticket_id": matched_fd_ticket_id,
+                    "subject": crm_ticket.get("subject", ""),
+                    "requester_id": crm_ticket.get("requester_id"),
+                    "status": crm_ticket.get("status"),
+                    "priority": crm_ticket.get("priority"),
+                }
+    elif resolved["matched_by"] == "not_found":
+        # Step 3.4: Domain fallback
+        email = resolved["email"]
+        domain = email.lower().split("@", 1)[-1] if "@" in email else ""
+        if domain:
+            print(f"    CRM entity not found for {email}, trying domain fallback...")
+            matched_fd_ticket = match_fd_ticket_by_domain(
+                domain, active_tickets, fd_contact_cache
+            )
+            if matched_fd_ticket:
+                print(f"    Matched FreshDesk ticket #{matched_fd_ticket['freshdesk_ticket_id']} by domain {domain}")
+                # Create CRM company for this domain
+                if dry_run:
+                    print(f"    [DRY-RUN] Would create CRM company for domain {domain}")
+                    company_name = domain
+                else:
+                    print(f"    Creating CRM company for domain {domain}...")
+                    company_data = {
+                        "name": domain,
+                        "domains": json.dumps([domain]),
+                    }
+                    stdout, _, _ = run_cmd(
+                        [CRM_SAFE, "companies", "create",
+                         "--json", json.dumps(company_data)]
+                    )
+                    try:
+                        new_company = json.loads(stdout)
+                        company_id = new_company["id"]
+                        company_name = new_company.get("name", domain)
+                        result["actions"].append(f"Created CRM company: {company_name}")
+                    except (json.JSONDecodeError, KeyError):
+                        result["errors"].append(f"Failed to create CRM company for {domain}")
+                        return result
+
+    if not matched_fd_ticket:
+        result["errors"].append(
+            f"No matching FreshDesk ticket found (attendees: {', '.join(attendee_emails)})"
+        )
+        return result
+
+    fd_ticket_id = matched_fd_ticket["freshdesk_ticket_id"]
+    ticket_subject = matched_fd_ticket.get("subject", "")
+    result["matched"] = True
+    result["company_name"] = company_name
+    result["freshdesk_ticket_id"] = fd_ticket_id
+
+    print(f"  Matched to ticket #{fd_ticket_id}: {ticket_subject}")
+
+    if dry_run:
+        result["actions"].append("[DRY-RUN] Would process this event")
+        return result
+
+    # Step 4: Ensure CRM records
+    requester_id = matched_fd_ticket.get("requester_id")
+    requester = None
+    if requester_id:
+        requester_contact = lookup_freshdesk_contact(requester_id)
+        if requester_contact:
+            name = requester_contact.get("name", "") or ""
+            parts = name.split(None, 1)
+            requester = {
+                "email": requester_contact.get("email", ""),
+                "name": name,
+                "first_name": parts[0] if parts else "",
+                "last_name": parts[1] if len(parts) > 1 else "",
+                "freshdesk_id": requester_id,
+            }
+
+    if not requester:
+        result["errors"].append(f"Could not look up requester {requester_id}")
+        return result
+
+    crm_result = ensure_crm_records(matched_fd_ticket, requester, company_id)
+    crm_contact_id = crm_result["crm_contact_id"]
+    crm_ticket_id = crm_result["crm_ticket_id"]
+
+    if crm_result["created_contact"]:
+        result["actions"].append("Created CRM contact")
+    if crm_result["created_ticket"]:
+        result["actions"].append("Created CRM ticket")
+
+    # Step 5: Create CRM meeting record
+    # Check for existing meeting with this google_event_id
+    stdout, _, _ = run_cmd(
+        [CRM_SAFE, "meetings", "list", "--ticket-id", str(crm_ticket_id)]
+    )
+    try:
+        existing_meetings = json.loads(stdout)
+    except json.JSONDecodeError:
+        existing_meetings = []
+
+    meeting_exists = any(
+        m.get("google_event_id") == event_id for m in existing_meetings
+    )
+    meeting_id = None
+
+    if meeting_exists:
+        for m in existing_meetings:
+            if m.get("google_event_id") == event_id:
+                meeting_id = m["id"]
+                break
+        result["actions"].append("CRM meeting already exists")
+    else:
+        start_time = event.get("start", {}).get("dateTime", "")
+        end_time = event.get("end", {}).get("dateTime", "")
+        meeting_data = {
+            "google_event_id": event_id,
+            "ticket_id": crm_ticket_id,
+            "contact_id": crm_contact_id,
+            "company_id": company_id,
+            "summary": summary,
+            "start_time": start_time,
+            "end_time": end_time,
+            "html_link": html_link,
+            "freshdesk_ticket_id": fd_ticket_id,
+            "color_id": color_id,
+        }
+        stdout, _, _ = run_cmd(
+            [CRM_SAFE, "meetings", "create",
+             "--json", json.dumps(meeting_data)]
+        )
+        try:
+            created_meeting = json.loads(stdout)
+            meeting_id = created_meeting["id"]
+            result["actions"].append("Created CRM meeting")
+        except (json.JSONDecodeError, KeyError):
+            result["errors"].append("Failed to create CRM meeting")
+            return result
+
+    # Step 6: Update FreshDesk ticket notes
+    print(f"    Scanning ticket #{fd_ticket_id} for existing support-notes note...")
+    scan_result = scan_ticket_notes(fd_ticket_id, "Support notes:")
+
+    event_date_str = format_event_date(event)
+    event_link = html_link
+
+    # Extract support doc URL from existing note if present
+    support_doc_url = None
+    if scan_result["found"] and scan_result["note_body"]:
+        doc_match = re.search(
+            r"https://docs\.google\.com/document/d/[^\s<\"]+",
+            scan_result["note_body"],
+        )
+        if doc_match:
+            support_doc_url = doc_match.group(0)
+
+    note_id = None
+    if scan_result["found"]:
+        # Update existing note - append calendar event line (preserve HTML)
+        existing_body = scan_result.get("note_body", "") or ""
+        new_body = build_note_body(existing_body, event_date_str, event_link)
+
+        if new_body is None:
+            result["actions"].append("Calendar event already in FreshDesk note")
+            note_id = scan_result["note_id"]
+        else:
+            note_id = scan_result["note_id"]
+            stdout, success = auto_confirm_freshdesk(
+                ["tickets", "note-update", str(fd_ticket_id), str(note_id),
+                 "--body", new_body],
+                auto_confirm,
+                label=f"Update note on ticket #{fd_ticket_id}",
+            )
+            if success:
+                result["actions"].append("Updated FreshDesk note with calendar event")
+            else:
+                result["actions"].append("FreshDesk note update pending confirmation")
+    else:
+        # Create new note with calendar event line (HTML formatted)
+        new_body = f'Calendar event {event_date_str}: <a href="{event_link}">{event_link}</a>'
+        stdout, success = auto_confirm_freshdesk(
+            ["tickets", "note", str(fd_ticket_id),
+             "--body", new_body, "--private", "true"],
+            auto_confirm,
+            label=f"Create note on ticket #{fd_ticket_id}",
+        )
+        if success:
+            try:
+                note_data = json.loads(stdout)
+                note_id = note_data.get("id")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            result["actions"].append("Created FreshDesk note with calendar event")
+        else:
+            result["actions"].append("FreshDesk note creation pending confirmation")
+
+    # Update CRM meeting with FreshDesk note ID
+    if meeting_id and note_id:
+        run_cmd(
+            [CRM_SAFE, "meetings", "update", str(meeting_id),
+             "--json", json.dumps({"freshdesk_note_id": note_id})]
+        )
+
+    # Step 7: Update calendar event
+    new_description = build_event_description(event, fd_ticket_id, support_doc_url)
+    new_summary = build_event_summary(
+        event, company_name or "", fd_ticket_id, ticket_subject
+    )
+
+    if new_description is not None or new_summary is not None:
+        patch_json = {}
+        if new_description is not None:
+            patch_json["description"] = new_description
+        if new_summary is not None:
+            patch_json["summary"] = new_summary
+
+        params = {"calendarId": "primary", "eventId": event_id}
+        stdout, success = auto_confirm_gws(
+            ["calendar", "events", "patch",
+             "--params", json.dumps(params),
+             "--json", json.dumps(patch_json)],
+            auto_confirm,
+            label=f"Update calendar event '{summary}'",
+        )
+        if success:
+            updates = []
+            if new_summary is not None:
+                updates.append("summary")
+            if new_description is not None:
+                updates.append("description")
+            result["actions"].append(f"Updated calendar event ({', '.join(updates)})")
+        else:
+            result["actions"].append("Calendar event update pending confirmation")
+    else:
+        result["actions"].append("Calendar event already up to date")
+
+    return result
+
+
+# --- Report ---
+
+
+def print_report(results):
+    """Print a summary report of all processed events."""
+    matched = [r for r in results if r["matched"]]
+    unmatched = [r for r in results if not r["matched"]]
+
+    print("\n" + "=" * 60)
+    print("SUPPORT CALENDAR REPORT")
+    print("=" * 60)
+
+    print(f"\nProcessed: {len(results)} event(s)")
+    print(f"Matched:   {len(matched)}")
+    print(f"Unmatched: {len(unmatched)}")
+
+    if matched:
+        print("\n--- Matched Events ---")
+        for r in matched:
+            print(f"\n  Event: {r['summary']}")
+            print(f"  Company: {r['company_name']}")
+            print(f"  Ticket: #{r['freshdesk_ticket_id']}")
+            for action in r["actions"]:
+                print(f"    - {action}")
+
+    if unmatched:
+        print("\n--- Unmatched Events ---")
+        for r in unmatched:
+            print(f"\n  Event: {r['summary']}")
+            for err in r["errors"]:
+                print(f"    ! {err}")
+
+    errors = [r for r in results if r["errors"] and r["matched"]]
+    if errors:
+        print("\n--- Errors ---")
+        for r in errors:
+            print(f"\n  Event: {r['summary']}")
+            for err in r["errors"]:
+                print(f"    ! {err}")
+
+    print()
+
+
+# --- Main ---
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Match support calendar events to FreshDesk tickets and update records"
+    )
+    parser.add_argument(
+        "--auto-confirm", action="store_true",
+        help="Automatically confirm all write operations",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be done without making changes",
+    )
+    args = parser.parse_args()
+
+    auto_confirm = args.auto_confirm
+    dry_run = args.dry_run
+
+    if dry_run:
+        auto_confirm = False
+
+    # Step 1: Fetch support-colored calendar events
+    events = fetch_support_events()
+    if not events:
+        print("No support calendar events found for the next 7 days.")
+        sys.exit(0)
+
+    # Step 2: Fetch active FreshDesk tickets
+    active_tickets = fetch_active_tickets()
+    if not active_tickets:
+        print("No assigned non-closed tickets found.")
+        sys.exit(0)
+
+    print(f"Found {len(active_tickets)} active ticket(s)")
+
+    # Pre-fetch CRM contacts and companies for in-memory lookup
+    print("Loading CRM data...")
+    stdout, _, _ = run_cmd([CRM_SAFE, "contacts", "list"])
+    try:
+        contacts_cache = json.loads(stdout)
+    except json.JSONDecodeError:
+        contacts_cache = []
+
+    stdout, _, _ = run_cmd([CRM_SAFE, "companies", "list"])
+    try:
+        companies_cache = json.loads(stdout)
+    except json.JSONDecodeError:
+        companies_cache = []
+
+    # Cache for FreshDesk contact lookups (requester_id -> contact dict)
+    fd_contact_cache = {}
+
+    # Process each event
+    results = []
+    for i, event in enumerate(events, 1):
+        summary = event.get("summary", "(No title)")
+        print(f"\n[{i}/{len(events)}] Processing: {summary}")
+
+        result = process_event(
+            event, active_tickets, contacts_cache, companies_cache,
+            fd_contact_cache, auto_confirm, dry_run,
+        )
+        results.append(result)
+
+    # Step 8: Report
+    print_report(results)
+
+
+if __name__ == "__main__":
+    main()

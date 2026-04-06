@@ -51,6 +51,14 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `crm-safe meetings create --json '{"google_event_id":"...","ticket_id":1,"contact_id":1,"company_id":1,"summary":"...","start_time":"...","end_time":"...","html_link":"...","freshdesk_ticket_id":123,"color_id":"4"}'` — create a meeting (write, `google_event_id` required)
 - `crm-safe meetings update ID --json '{"freshdesk_note_id":456}'` — update a meeting (write)
 
+### Emails (read + create)
+
+- `crm-safe emails list` — list all emails
+- `crm-safe emails list --company-id ID` — list emails for a company
+- `crm-safe emails list --contact-id ID` — list emails for a contact
+- `crm-safe emails view ID` — view a single email
+- `crm-safe emails create --json '{"gmail_message_id":"...","sender_email":"...","sender_name":"...","subject":"...","gmail_url":"...","received_at":"...","contact_id":1,"company_id":1}'` — create email record (gmail_message_id required)
+
 ### Files (read + create + link/unlink)
 
 - `crm-safe files list` — list all drive files
@@ -71,7 +79,7 @@ The following are NOT available through crm-safe and must NEVER be attempted:
 ## Database Schema Overview
 
 ### companies
-Key fields: `id`, `name`, `freshdesk_id`, `domains` (JSON array), `health_score`, `account_tier`, `industry`, `renewal_date`, `custom_fields` (JSON object)
+Key fields: `id`, `name`, `freshdesk_id`, `domains` (JSON array), `health_score`, `account_tier`, `vip` (0/1), `industry`, `renewal_date`, `custom_fields` (JSON object)
 
 ### contacts
 Key fields: `id`, `name`, `first_name`, `last_name`, `email`, `phone`, `job_title`, `company_id` (FK to companies), `freshdesk_id`, `active`, `vip`, `tags` (JSON array)
@@ -87,6 +95,9 @@ Key fields: `id`, `google_file_id`, `name`, `mime_type`, `web_view_link`
 
 ### meetings
 Key fields: `id`, `google_event_id`, `ticket_id` (FK to tickets), `contact_id` (FK to contacts), `company_id` (FK to companies), `summary`, `start_time`, `end_time`, `html_link`, `freshdesk_ticket_id`, `freshdesk_note_id`, `color_id`
+
+### emails
+Key fields: `id`, `gmail_message_id`, `contact_id` (FK), `company_id` (FK), `sender_email`, `sender_name`, `subject`, `gmail_url`, `received_at`
 
 ### company_files
 Junction table: `company_id` (FK to companies), `file_id` (FK to drive_files), `linked_at`

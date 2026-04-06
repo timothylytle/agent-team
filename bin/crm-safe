@@ -164,7 +164,7 @@ def cmd_companies_create(args, cmd_str):
     cols = []
     vals = []
     allowed = ('name', 'description', 'domains', 'health_score', 'account_tier',
-               'industry', 'renewal_date', 'custom_fields', 'freshdesk_id')
+               'vip', 'industry', 'renewal_date', 'custom_fields', 'freshdesk_id')
     for k in allowed:
         if k in data:
             cols.append(k)
@@ -198,7 +198,7 @@ def cmd_companies_update(args, cmd_str):
         output_json({'error': f'company {args.id} not found'})
         sys.exit(1)
     allowed = ('name', 'description', 'domains', 'health_score', 'account_tier',
-               'industry', 'renewal_date', 'custom_fields', 'freshdesk_id')
+               'vip', 'industry', 'renewal_date', 'custom_fields', 'freshdesk_id')
     sets = []
     vals = []
     for k in allowed:
@@ -557,6 +557,77 @@ def cmd_meetings_update(args, cmd_str):
     log_entry(cmd_str, 'CONFIRMED', 0)
 
 
+# --- Command: emails ---
+
+def cmd_emails_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    query = (
+        'SELECT e.*, co.name AS contact_name, c.name AS company_name '
+        'FROM emails e '
+        'LEFT JOIN contacts co ON e.contact_id = co.id '
+        'LEFT JOIN companies c ON e.company_id = c.id'
+    )
+    params = []
+    conditions = []
+    if args.company_id is not None:
+        conditions.append('e.company_id = ?')
+        params.append(args.company_id)
+    if args.contact_id is not None:
+        conditions.append('e.contact_id = ?')
+        params.append(args.contact_id)
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    query += ' ORDER BY e.received_at DESC'
+    rows = db.execute(query, params).fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_emails_view(args, cmd_str):
+    if args.id is None:
+        deny('emails view requires an ID', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute('SELECT * FROM emails WHERE id = ?', (args.id,)).fetchone()
+    if not row:
+        output_json({'error': f'email {args.id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    output_json(dict(row))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_emails_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if 'gmail_message_id' not in data or not data['gmail_message_id']:
+        deny('emails create requires "gmail_message_id" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create email', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('gmail_message_id', 'contact_id', 'company_id', 'sender_email',
+               'sender_name', 'subject', 'gmail_url', 'received_at')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO emails ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM emails WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
 # --- Command: files ---
 
 def cmd_files_list(args, cmd_str):
@@ -689,6 +760,9 @@ def _build_cmd_str(args):
     if getattr(args, 'ticket_id', None) is not None:
         parts.append('--ticket-id')
         parts.append(str(args.ticket_id))
+    if getattr(args, 'contact_id', None) is not None:
+        parts.append('--contact-id')
+        parts.append(str(args.contact_id))
     return ' '.join(parts)
 
 
@@ -706,7 +780,7 @@ def build_parser():
         prog='crm-safe',
         description='Safe CRM database wrapper',
     )
-    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files', 'meetings'])
+    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files', 'meetings', 'emails'])
     parser.add_argument('action')
     parser.add_argument('id', nargs='?', type=int, default=None)
     parser.add_argument('--json', dest='json', default=None)
@@ -714,6 +788,7 @@ def build_parser():
     parser.add_argument('--file-id', type=int, default=None)
     parser.add_argument('--status', type=int, default=None)
     parser.add_argument('--ticket-id', type=int, default=None)
+    parser.add_argument('--contact-id', type=int, default=None)
     parser.add_argument('--confirmed', default=None)
     return parser
 
@@ -737,6 +812,9 @@ ROUTES = {
     'meetings:view': cmd_meetings_view,
     'meetings:create': cmd_meetings_create,
     'meetings:update': cmd_meetings_update,
+    'emails:list': cmd_emails_list,
+    'emails:view': cmd_emails_view,
+    'emails:create': cmd_emails_create,
     'files:list': cmd_files_list,
     'files:create': cmd_files_create,
     'files:link': cmd_files_link,

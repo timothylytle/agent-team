@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Deterministic Email updater.
+
+Fetches inbox emails, filters out noise, classifies senders by CRM data,
+and updates the Email section of today's daily log entry.
+
+Usage:
+    bin/update-email [--auto-confirm]
+"""
+
+import argparse
+import json
+import re
+import sys
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    CRM_DB_PATH,
+    CRM_SAFE,
+    GWS_SAFE,
+    execute_batch_update,
+    extract_section_text,
+    get_cache_db,
+    read_configs,
+    run_cmd,
+    update_cache,
+    utf16_len,
+)
+
+
+CATEGORY_LABELS_TO_FILTER = {
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+    "CATEGORY_SOCIAL",
+}
+
+NOREPLY_RE = re.compile(r"^no.?reply@", re.IGNORECASE)
+
+
+# --- Section boundaries ---
+
+
+def get_section_boundaries(doc_id, today_str):
+    """Query the daily-log-cache for today's email section boundaries.
+    Returns (start_index, end_index) or None if not cached."""
+    db = get_cache_db()
+    entry = db.execute(
+        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
+        (doc_id, today_str),
+    ).fetchone()
+    if not entry:
+        db.close()
+        return None
+    section = db.execute(
+        "SELECT start_index, end_index FROM sections "
+        "WHERE entry_id = ? AND section_type = 'email'",
+        (entry["id"],),
+    ).fetchone()
+    db.close()
+    if not section:
+        return None
+    return section["start_index"], section["end_index"]
+
+
+def _get_section_boundaries_by_type(doc_id, today_str, section_type):
+    """Query the daily-log-cache for a specific section type's boundaries.
+    Returns (start_index, end_index) or None."""
+    db = get_cache_db()
+    entry = db.execute(
+        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
+        (doc_id, today_str),
+    ).fetchone()
+    if not entry:
+        db.close()
+        return None
+    section = db.execute(
+        "SELECT start_index, end_index FROM sections "
+        "WHERE entry_id = ? AND section_type = ?",
+        (entry["id"], section_type),
+    ).fetchone()
+    db.close()
+    if not section:
+        return None
+    return section["start_index"], section["end_index"]
+
+
+def _insert_email_section(doc_id, insert_index, style, auto_confirm):
+    """Insert an 'Email:' heading and empty placeholder line at insert_index."""
+    heading_text = "Email:\n"
+    placeholder_text = "\n"
+    full_text = heading_text + placeholder_text
+
+    requests = []
+
+    # 1. Insert the heading + placeholder text
+    requests.append({
+        "insertText": {
+            "location": {"index": insert_index},
+            "text": full_text,
+        }
+    })
+
+    # 2. Apply HEADING_2 style to the "Email:" line
+    heading_start = insert_index
+    heading_end = insert_index + utf16_len(heading_text)
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": heading_start, "endIndex": heading_end},
+            "paragraphStyle": {"namedStyleType": "HEADING_2"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Apply NORMAL_TEXT style to the placeholder line
+    placeholder_start = heading_end
+    placeholder_end = heading_end + utf16_len(placeholder_text)
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": placeholder_start, "endIndex": placeholder_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 4. Apply heading font styling
+    heading_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
+    }
+    heading_fields = "weightedFontFamily"
+    if style["colors"].get("headingText"):
+        heading_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["headingText"]}
+        }
+        heading_fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": heading_start, "endIndex": heading_end},
+            "textStyle": heading_text_style,
+            "fields": heading_fields,
+        }
+    })
+
+    # 5. Apply body font styling to the placeholder line
+    body_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    body_fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        body_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        body_fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": placeholder_start, "endIndex": placeholder_end},
+            "textStyle": body_text_style,
+            "fields": body_fields,
+        }
+    })
+
+    batch = {"requests": requests}
+    success = execute_batch_update(doc_id, batch, auto_confirm)
+    if not success:
+        print("ERROR: Failed to insert Email section (dry-run not confirmed).", file=sys.stderr)
+        sys.exit(2)
+
+
+# --- Gmail fetching ---
+
+
+def fetch_inbox_message_ids():
+    """Fetch all message IDs from Inbox, excluding Ack'd label."""
+    params = {
+        "userId": "me",
+        "labelIds": ["INBOX"],
+        "q": "-label:Ack'd",
+    }
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "gmail", "users", "messages", "list",
+         "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse Gmail messages list as JSON", file=sys.stderr)
+        print(f"  raw output: {stdout}", file=sys.stderr)
+        sys.exit(1)
+
+    messages = data.get("messages", [])
+    return [m["id"] for m in messages]
+
+
+def fetch_message_metadata(msg_id):
+    """Fetch metadata for a single message."""
+    params = {
+        "userId": "me",
+        "id": msg_id,
+        "format": "metadata",
+        "metadataHeaders": [
+            "From", "To", "Cc", "Subject", "Sender",
+            "List-Unsubscribe", "List-Id", "Auto-Submitted",
+        ],
+    }
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "gmail", "users", "messages", "get",
+         "--params", json.dumps(params)]
+    )
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        print(f"WARNING: failed to parse message {msg_id} metadata", file=sys.stderr)
+        return None
+
+
+# --- Filtering ---
+
+
+def get_header(msg, name):
+    """Get a header value from a message metadata response."""
+    headers = msg.get("payload", {}).get("headers", [])
+    for h in headers:
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def should_filter(msg):
+    """Return True if the message should be filtered out."""
+    label_ids = set(msg.get("labelIds", []))
+
+    # Category label filtering
+    if label_ids & CATEGORY_LABELS_TO_FILTER:
+        return True
+
+    # Header-based filtering
+    if get_header(msg, "List-Unsubscribe"):
+        return True
+    if get_header(msg, "List-Id"):
+        return True
+
+    auto_submitted = get_header(msg, "Auto-Submitted")
+    if auto_submitted and auto_submitted.lower() != "no":
+        return True
+
+    # Calendar notification
+    sender = get_header(msg, "Sender")
+    if "calendar-notification@google.com" in sender:
+        return True
+
+    # No-reply sender
+    from_addr = get_header(msg, "From")
+    email_match = re.search(r"<([^>]+)>", from_addr)
+    email = email_match.group(1) if email_match else from_addr
+    if NOREPLY_RE.search(email):
+        return True
+
+    return False
+
+
+# --- Sender parsing ---
+
+
+def parse_sender(from_header):
+    """Parse From header into (name, email).
+    Handles 'Name <email>' and bare 'email' formats."""
+    match = re.match(r'"?([^"<]*)"?\s*<([^>]+)>', from_header)
+    if match:
+        name = match.group(1).strip()
+        email = match.group(2).strip()
+    else:
+        email = from_header.strip()
+        name = email.split("@")[0]
+    return name, email
+
+
+def get_domain(email):
+    """Extract domain from an email address."""
+    parts = email.split("@")
+    return parts[1].lower() if len(parts) == 2 else ""
+
+
+# --- CRM classification ---
+
+
+def load_crm_companies():
+    """Load companies from CRM database with domains and vip status.
+    Returns list of dicts with 'id', 'name', 'domains' (list of strings), and 'vip' (int)."""
+    import sqlite3
+
+    if not CRM_DB_PATH.is_file():
+        print("WARNING: CRM database not found, skipping CRM classification", file=sys.stderr)
+        return []
+
+    conn = sqlite3.connect(str(CRM_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, name, domains, vip FROM companies").fetchall()
+    conn.close()
+
+    companies = []
+    for row in rows:
+        domains_raw = row["domains"]
+        vip = row["vip"] or 0
+        if domains_raw:
+            try:
+                domains = json.loads(domains_raw)
+                if isinstance(domains, list):
+                    companies.append({
+                        "id": row["id"],
+                        "name": row["name"],
+                        "domains": [d.lower() for d in domains],
+                        "vip": vip,
+                    })
+            except json.JSONDecodeError:
+                pass
+    return companies
+
+
+def classify_sender(email, companies):
+    """Classify a sender email by CRM data.
+    Returns (category, company_name, company_id) where category is one of:
+    'vip', 'customer', 'internal', 'unknown', company_name is
+    the company name string or None, and company_id is the CRM id or None."""
+    domain = get_domain(email)
+    if not domain:
+        return "unknown", None, None
+
+    if domain == "miarec.com":
+        # Look up MiaRec company_id if it exists in CRM
+        for company in companies:
+            if domain in company["domains"]:
+                return "internal", "MiaRec", company["id"]
+        return "internal", "MiaRec", None
+
+    for company in companies:
+        if domain in company["domains"]:
+            if company["vip"]:
+                return "vip", company["name"], company["id"]
+            return "customer", company["name"], company["id"]
+
+    return "unknown", None, None
+
+
+def load_crm_contacts():
+    """Load contacts from CRM database and build an email-to-contact_id lookup.
+    Returns dict mapping lowercase email to contact id."""
+    import sqlite3
+
+    if not CRM_DB_PATH.is_file():
+        return {}
+
+    conn = sqlite3.connect(str(CRM_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, email FROM contacts WHERE email IS NOT NULL").fetchall()
+    conn.close()
+
+    return {row["email"].lower(): row["id"] for row in rows if row["email"]}
+
+
+def save_email_to_crm(record):
+    """Save an email record to the CRM via crm-safe.
+    record is a dict with gmail_message_id, sender_email, sender_name,
+    subject, gmail_url, received_at, and optionally contact_id, company_id.
+    Silently skips if gmail_message_id already exists (UNIQUE constraint)."""
+    try:
+        result = subprocess.run(
+            [str(CRM_SAFE), "emails", "create", "--json", json.dumps(record)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else ""
+            stdout = result.stdout.strip() if result.stdout else ""
+            # UNIQUE constraint violation means it already exists -- that's fine
+            if "UNIQUE constraint" in stderr or "UNIQUE constraint" in stdout:
+                return
+            print(f"WARNING: CRM save failed for {record.get('gmail_message_id', '?')}: "
+                  f"{stderr or stdout}", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: CRM save error for {record.get('gmail_message_id', '?')}: {e}",
+              file=sys.stderr)
+
+
+# --- Deduplication ---
+
+
+def parse_existing_entries(section_text):
+    """Extract existing email entries from section text for dedup.
+    Returns set of (sender_name, subject) tuples."""
+    entries = set()
+    for line in section_text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Lines look like: [Sender Name] Subject Line
+        # or: [Company - Sender Name] Subject Line
+        # or: either format with (Add to CRM?) suffix
+        match = re.match(r"\[([^\]]+)\]\s+(.+?)(?:\s+\(Add to CRM\?\))?\s*$", line)
+        if match:
+            bracket_content = match.group(1)
+            # Extract sender name: strip company prefix if present
+            if " - " in bracket_content:
+                sender_name = bracket_content.split(" - ", 1)[1]
+            else:
+                sender_name = bracket_content
+            entries.add((sender_name, match.group(2)))
+    return entries
+
+
+# --- Build batchUpdate ---
+
+
+from lib.daily_log_utils import fetch_doc  # noqa: E402
+
+
+def build_batch_update(email_lines, section_end, style):
+    """Build the batchUpdate JSON for inserting email lines.
+
+    Inserts at section_end (the startIndex of the next section heading).
+    Each line: [Sender Name] Subject\n
+    Then applies checkbox bullets, font styling, and Gmail links.
+
+    email_lines is a list of (line_text, gmail_url) tuples.
+    """
+    line_texts = [line for line, _ in email_lines]
+    insert_text = "\n".join(line_texts) + "\n"
+    insert_index = section_end
+
+    requests = []
+
+    # 1. Insert text
+    requests.append({
+        "insertText": {
+            "location": {"index": insert_index},
+            "text": insert_text,
+        }
+    })
+
+    # 2. Reset paragraph style to NORMAL_TEXT
+    text_start = insert_index
+    text_end = insert_index + utf16_len(insert_text)
+
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": text_start,
+                "endIndex": text_end,
+            },
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Apply checkbox bullets
+    requests.append({
+        "createParagraphBullets": {
+            "range": {
+                "startIndex": text_start,
+                "endIndex": text_end,
+            },
+            "bulletPreset": style["bulletPresets"]["checkbox"],
+        }
+    })
+
+    # 4. Apply font styling
+    text_style = {
+        "weightedFontFamily": {
+            "fontFamily": style["fonts"]["body"],
+        }
+    }
+    fields = "weightedFontFamily"
+
+    if style["colors"].get("bodyText"):
+        text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {
+                "startIndex": text_start,
+                "endIndex": text_end,
+            },
+            "textStyle": text_style,
+            "fields": fields,
+        }
+    })
+
+    # 5. Apply Gmail links to each line
+    cursor = insert_index
+    for line_text, gmail_url in email_lines:
+        line_start = cursor
+        line_end = cursor + utf16_len(line_text)
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": line_start, "endIndex": line_end},
+                "textStyle": {"link": {"url": gmail_url}},
+                "fields": "link",
+            }
+        })
+        # Advance past line text + newline
+        cursor = line_end + utf16_len("\n")
+
+    return {"requests": requests}
+
+
+# --- Main ---
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Update Email section of the daily log")
+    parser.add_argument("--auto-confirm", action="store_true",
+                        help="Automatically confirm the batchUpdate write")
+    args = parser.parse_args()
+    auto_confirm = args.auto_confirm
+
+    # Step 1: Read configs
+    config, style = read_configs()
+    doc_id = config["documentId"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_heading = datetime.now().strftime("%A %b %-d, %Y")
+
+    print(f"Updating Email for {today_heading}")
+    print(f"Document ID: {doc_id}")
+
+    # Step 2: Check cache for section boundaries
+    boundaries = get_section_boundaries(doc_id, today_str)
+    if not boundaries:
+        # Check if the entry exists but is missing the Email section
+        thoughts_boundaries = _get_section_boundaries_by_type(doc_id, today_str, "thoughts_ideas")
+        if not thoughts_boundaries:
+            print("ERROR: No cached entry for today. Run /daily-log first to create the entry.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        # Entry exists but has no Email section -- insert it before Thoughts / Ideas
+        print("Email section not found in today's entry. Inserting it...")
+        _insert_email_section(doc_id, thoughts_boundaries[0], style, auto_confirm)
+        update_cache(doc_id)
+
+        # Re-fetch boundaries after insertion
+        boundaries = get_section_boundaries(doc_id, today_str)
+        if not boundaries:
+            print("ERROR: Failed to find Email section after insertion.", file=sys.stderr)
+            sys.exit(1)
+
+    section_start, section_end = boundaries
+    print(f"Email section: index {section_start} to {section_end}")
+
+    # Step 3: Fetch inbox message IDs
+    print("Fetching inbox messages...")
+    msg_ids = fetch_inbox_message_ids()
+    print(f"Found {len(msg_ids)} inbox message(s) without Ack'd label")
+
+    if not msg_ids:
+        print("No inbox messages to process.")
+        sys.exit(0)
+
+    # Step 4: Fetch metadata for each message
+    print("Fetching message metadata...")
+    messages = []
+    for msg_id in msg_ids:
+        msg = fetch_message_metadata(msg_id)
+        if msg:
+            messages.append(msg)
+
+    # Step 5: Filter out noise
+    filtered = [m for m in messages if not should_filter(m)]
+    print(f"After filtering: {len(filtered)} message(s) remaining (filtered out {len(messages) - len(filtered)})")
+
+    if not filtered:
+        print("No relevant emails after filtering.")
+        sys.exit(0)
+
+    # Step 6: Load CRM companies and contacts for classification
+    companies = load_crm_companies()
+    print(f"Loaded {len(companies)} CRM companies for classification")
+    contacts_by_email = load_crm_contacts()
+    print(f"Loaded {len(contacts_by_email)} CRM contacts for email lookup")
+
+    # Step 7: Classify and format emails
+    classified = {"vip": [], "customer": [], "internal": [], "unknown": []}
+
+    for msg in filtered:
+        from_header = get_header(msg, "From")
+        subject = get_header(msg, "Subject") or "(No subject)"
+        sender_name, sender_email = parse_sender(from_header)
+        category, company_name, company_id = classify_sender(sender_email, companies)
+        msg_id = msg["id"]
+        contact_id = contacts_by_email.get(sender_email.lower())
+
+        # Convert internalDate (ms since epoch) to ISO 8601
+        internal_date = msg.get("internalDate")
+        if internal_date:
+            received_at = datetime.fromtimestamp(
+                int(internal_date) / 1000, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            received_at = None
+
+        if company_name:
+            line = f"[{company_name} - {sender_name}] {subject}"
+        else:
+            line = f"[{sender_name}] {subject}"
+        if category == "unknown":
+            line += " (Add to CRM?)"
+
+        gmail_url = f"https://mail.google.com/mail/u/0/#all/{msg_id}"
+        classified[category].append((
+            sender_name, subject, line, gmail_url,
+            msg_id, sender_email, company_id, contact_id, received_at,
+        ))
+
+    # Step 8: Fetch doc and check for existing entries
+    doc = fetch_doc(doc_id)
+    section_text = extract_section_text(doc, section_start, section_end)
+    existing_entries = parse_existing_entries(section_text)
+    print(f"Found {len(existing_entries)} existing email entries in doc")
+
+    # Step 9: Build ordered list of new email lines, deduplicating
+    email_lines = []  # list of (line_text, gmail_url)
+    new_email_records = []  # CRM records for new emails
+    for category in ("vip", "customer", "internal", "unknown"):
+        for (sender_name, subject, line, gmail_url,
+             msg_id, sender_email, company_id, contact_id, received_at) in classified[category]:
+            if (sender_name, subject) not in existing_entries:
+                email_lines.append((line, gmail_url))
+                record = {
+                    "gmail_message_id": msg_id,
+                    "sender_email": sender_email,
+                    "sender_name": sender_name,
+                    "subject": subject,
+                    "gmail_url": gmail_url,
+                }
+                if received_at:
+                    record["received_at"] = received_at
+                if contact_id is not None:
+                    record["contact_id"] = contact_id
+                if company_id is not None:
+                    record["company_id"] = company_id
+                new_email_records.append(record)
+
+    if not email_lines:
+        print("Email section is already up to date.")
+        sys.exit(0)
+
+    print(f"New emails to add: {len(email_lines)}")
+    for line, _ in email_lines:
+        print(f"  {line}")
+
+    # Step 10: Build and execute batchUpdate
+    batch = build_batch_update(email_lines, section_end, style)
+    success = execute_batch_update(doc_id, batch, auto_confirm)
+
+    if not success:
+        sys.exit(2)
+
+    # Step 11: Save email records to CRM
+    print(f"Saving {len(new_email_records)} email record(s) to CRM...")
+    for record in new_email_records:
+        save_email_to_crm(record)
+
+    # Step 12: Update cache
+    update_cache(doc_id)
+
+    print(f"\nDone. Added {len(email_lines)} email(s) to Email section.")
+
+
+if __name__ == "__main__":
+    main()

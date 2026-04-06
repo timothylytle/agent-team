@@ -40,6 +40,7 @@ SECTION_MAP = {
     "Task List:": "task_list",
     "Open Tickets:": "open_tickets",
     "Random Fact:": "random_fact",
+    "Email:": "email",
     "Thoughts / Ideas:": "thoughts_ideas",
     "Notes:": "notes",
 }

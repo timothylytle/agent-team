@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""Deterministic Daily Log archiver.
+
+Archives old daily log entries from the main document to a tabbed archive
+document. Entries dated before the Monday of the current week are moved
+to the archive, organized by Year > Quarter > Week tabs.
+
+Usage:
+    bin/archive-daily-log [--auto-confirm] [--dry-run]
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    GWS_SAFE,
+    execute_batch_update,
+    fetch_doc,
+    parse_doc_entries,
+    read_configs,
+    run_cmd,
+    update_cache,
+    utf16_len,
+)
+
+
+# --- Date/Week Calculations ---
+
+
+def get_monday_of_current_week():
+    """Return the Monday of the current week as a date object."""
+    today = date.today()
+    return today - timedelta(days=today.weekday())
+
+
+def get_quarter_info(d):
+    """Returns (quarter_number, quarter_start_date) for a given date."""
+    q = (d.month - 1) // 3 + 1
+    quarter_start = date(d.year, (q - 1) * 3 + 1, 1)
+    return q, quarter_start
+
+
+def get_first_monday_on_or_after(d):
+    """Returns the first Monday on or after date d."""
+    if d.weekday() == 0:
+        return d
+    days_ahead = (7 - d.weekday()) % 7
+    return d + timedelta(days=days_ahead)
+
+
+def get_week_info(entry_date):
+    """Returns (year, quarter, week_number, week_monday, week_friday) for an entry date."""
+    # Monday of the entry's week
+    week_monday = entry_date - timedelta(days=entry_date.weekday())
+
+    # Derive year and quarter from week_monday so the entire work week
+    # stays in one quarter even when a boundary falls mid-week.
+    year = week_monday.year
+    quarter, quarter_start = get_quarter_info(week_monday)
+    first_monday = get_first_monday_on_or_after(quarter_start)
+    week_friday = week_monday + timedelta(days=4)
+
+    # Week number relative to quarter (1-based)
+    week_number = ((week_monday - first_monday).days // 7) + 1
+    # Clamp: entries before the quarter's first Monday get week 1
+    if week_number < 1:
+        week_number = 1
+
+    return year, quarter, week_number, week_monday, week_friday
+
+
+def format_week_tab_title(week_number, week_monday, week_friday):
+    """Format the week tab title."""
+    if week_monday.month == week_friday.month:
+        mon_str = week_monday.strftime("%b")
+        return f"Week {week_number} ({mon_str} {week_monday.day}-{week_friday.day})"
+    else:
+        mon_str = week_monday.strftime("%b")
+        fri_str = week_friday.strftime("%b")
+        return f"Week {week_number} ({mon_str} {week_monday.day} - {fri_str} {week_friday.day})"
+
+
+# --- Archive Document Tab Management ---
+
+
+def fetch_doc_with_tabs(doc_id):
+    """Fetch a Google Doc with tab content included."""
+    print("Fetching archive document with tabs...")
+    stdout, _, _ = run_cmd(
+        [
+            GWS_SAFE,
+            "docs",
+            "documents",
+            "get",
+            "--params",
+            json.dumps({"documentId": doc_id, "includeTabsContent": True}),
+        ]
+    )
+    try:
+        doc = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse archive document output as JSON", file=sys.stderr)
+        print(f"  raw output: {stdout}", file=sys.stderr)
+        sys.exit(1)
+    return doc
+
+
+def build_tab_map(tabs, tab_map=None):
+    """Recursively build {tab_title: tab_id} from the tabs array."""
+    if tab_map is None:
+        tab_map = {}
+    for tab in tabs:
+        props = tab.get("tabProperties", {})
+        title = props.get("title", "")
+        tab_id = props.get("tabId", "")
+        if title:
+            tab_map[title] = tab_id
+        for child in tab.get("childTabs", []):
+            build_tab_map([child], tab_map)
+    return tab_map
+
+
+def create_tabs_at_level(archive_doc_id, requests, auto_confirm):
+    """Execute a batchUpdate to create tabs, return updated tab map entries.
+
+    Returns a dict of {title: tab_id} for newly created tabs.
+    """
+    if not requests:
+        return {}
+
+    batch = {"requests": requests}
+    json_str = json.dumps(batch)
+    params_str = json.dumps({"documentId": archive_doc_id})
+
+    cmd = [
+        GWS_SAFE,
+        "docs",
+        "documents",
+        "batchUpdate",
+        "--json",
+        json_str,
+        "--params",
+        params_str,
+    ]
+
+    print(f"Creating {len(requests)} tab(s) (dry-run)...")
+    stdout, stderr, rc = run_cmd(cmd, check=False)
+
+    if rc == 2:
+        # Dry-run enforced
+        nonce_match = re.search(r"--confirmed\s+([a-f0-9]+)", stderr)
+        if not nonce_match:
+            print("ERROR: could not parse nonce from dry-run output", file=sys.stderr)
+            print(f"stderr: {stderr}", file=sys.stderr)
+            sys.exit(1)
+        nonce = nonce_match.group(1)
+
+        if auto_confirm:
+            print(f"Auto-confirming tab creation with nonce {nonce}...")
+            confirm_cmd = cmd + ["--confirmed", nonce]
+            stdout2, stderr2, rc2 = run_cmd(confirm_cmd, check=False)
+            if rc2 != 0:
+                print(f"ERROR: tab creation failed with exit code {rc2}", file=sys.stderr)
+                if stderr2:
+                    print(f"  stderr: {stderr2.strip()}", file=sys.stderr)
+                sys.exit(1)
+            stdout = stdout2
+            print("Tab creation confirmed.")
+        else:
+            print(f"\nDry-run enforced. To confirm, re-run with --auto-confirm or manually run:")
+            print(f"  {' '.join(str(a) for a in cmd)} --confirmed {nonce}")
+            sys.exit(2)
+    elif rc != 0:
+        print(f"ERROR: tab creation failed with exit code {rc}", file=sys.stderr)
+        if stderr:
+            print(f"  stderr: {stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse response to get new tab IDs
+    new_tabs = {}
+    try:
+        response = json.loads(stdout)
+        replies = response.get("replies", [])
+        for i, reply in enumerate(replies):
+            tab_props = reply.get("addDocumentTab", {}).get("tabProperties", {})
+            title = tab_props.get("title", "")
+            tab_id = tab_props.get("tabId", "")
+            if title and tab_id:
+                new_tabs[title] = tab_id
+    except json.JSONDecodeError:
+        print("WARNING: could not parse tab creation response", file=sys.stderr)
+
+    return new_tabs
+
+
+def ensure_tabs_exist(archive_doc_id, entries_by_week, tab_map, auto_confirm):
+    """Create any missing year/quarter/week tabs. Updates tab_map in place."""
+
+    # Collect all needed tabs
+    needed_years = {}       # {year_title: None}
+    needed_quarters = {}    # {quarter_title: year_title}
+    needed_weeks = {}       # {week_title: (quarter_title, week_number)}
+
+    for key in entries_by_week:
+        year_title, quarter_title, week_title = key
+        needed_years[year_title] = None
+        needed_quarters[quarter_title] = year_title
+        needed_weeks[week_title] = (quarter_title, entries_by_week[key]["week_number"])
+
+    # Level 1: Year tabs
+    year_requests = []
+    for year_title in sorted(needed_years.keys()):
+        if year_title not in tab_map:
+            year_requests.append({
+                "addDocumentTab": {
+                    "tabProperties": {"title": year_title, "index": 0}
+                }
+            })
+
+    if year_requests:
+        new_tabs = create_tabs_at_level(archive_doc_id, year_requests, auto_confirm)
+        tab_map.update(new_tabs)
+
+    # Level 2: Quarter tabs
+    quarter_requests = []
+    for quarter_title in sorted(needed_quarters.keys()):
+        if quarter_title not in tab_map:
+            year_title = needed_quarters[quarter_title]
+            parent_id = tab_map.get(year_title)
+            if not parent_id:
+                print(f"ERROR: parent year tab '{year_title}' not found for quarter '{quarter_title}'", file=sys.stderr)
+                sys.exit(1)
+            # Quarter index: Q1=0, Q2=1, Q3=2, Q4=3
+            q_num = int(quarter_title.split("-Q")[1]) - 1
+            quarter_requests.append({
+                "addDocumentTab": {
+                    "tabProperties": {
+                        "title": quarter_title,
+                        "parentTabId": parent_id,
+                        "index": q_num,
+                    }
+                }
+            })
+
+    if quarter_requests:
+        new_tabs = create_tabs_at_level(archive_doc_id, quarter_requests, auto_confirm)
+        tab_map.update(new_tabs)
+
+    # Level 3: Week tabs
+    week_requests = []
+    for week_title in sorted(needed_weeks.keys()):
+        if week_title not in tab_map:
+            quarter_title, week_number = needed_weeks[week_title]
+            parent_id = tab_map.get(quarter_title)
+            if not parent_id:
+                print(f"ERROR: parent quarter tab '{quarter_title}' not found for week '{week_title}'", file=sys.stderr)
+                sys.exit(1)
+            week_requests.append({
+                "addDocumentTab": {
+                    "tabProperties": {
+                        "title": week_title,
+                        "parentTabId": parent_id,
+                        "index": week_number - 1,
+                    }
+                }
+            })
+
+    if week_requests:
+        new_tabs = create_tabs_at_level(archive_doc_id, week_requests, auto_confirm)
+        tab_map.update(new_tabs)
+
+
+# --- Entry Content Extraction ---
+
+
+def extract_entry_for_archive(doc, entry_start, entry_end):
+    """Extract text, formatting metadata, and special elements from an entry.
+
+    Returns:
+        text: The full text string to insert (richLink titles substituted,
+              person/image positions excluded from text)
+        paragraphs: List of paragraph metadata dicts with keys:
+            text, named_style, has_bullet, section_context, archive_start
+        rich_links: List of (archive_start, archive_end, uri) tuples
+            (positions relative to inserted text start)
+        images: List of (archive_pos, content_uri, height, width) tuples
+        persons: List of (archive_pos, email) tuples
+    """
+    body_content = doc.get("body", {}).get("content", [])
+    inline_objects = doc.get("inlineObjects", {})
+
+    text_parts = []
+    paragraphs = []
+    rich_links = []
+    images = []
+    persons = []
+
+    # Track which section we're in for bullet preset inference
+    current_section = None
+
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        el_end = element.get("endIndex", 0)
+        if el_end <= entry_start or el_start >= entry_end:
+            continue
+
+        paragraph = element.get("paragraph")
+        if not paragraph:
+            continue
+
+        pstyle = paragraph.get("paragraphStyle", {})
+        named_style = pstyle.get("namedStyleType", "NORMAL_TEXT")
+        has_bullet = "bullet" in pstyle
+
+        # Track section context for bullet preset inference
+        if named_style == "HEADING_2":
+            h2_text = ""
+            for pe in paragraph.get("elements", []):
+                h2_text += pe.get("textRun", {}).get("content", "")
+            h2_text = h2_text.strip()
+            if "Open Tickets" in h2_text:
+                current_section = "open_tickets"
+            else:
+                current_section = "other"
+
+        para_text_parts = []
+        # Calculate archive start position using utf16_len of all text so far
+        cumulative_text = "".join(text_parts)
+        para_archive_start = utf16_len(cumulative_text)
+
+        for pe in paragraph.get("elements", []):
+            if "textRun" in pe:
+                content = pe["textRun"].get("content", "")
+                para_text_parts.append(content)
+
+            elif "richLink" in pe:
+                rl_props = pe["richLink"].get("richLinkProperties", {})
+                title = rl_props.get("title") or rl_props.get("uri", "")
+                uri = rl_props.get("uri", "")
+                # Position in archive text
+                preceding_text = "".join(text_parts) + "".join(para_text_parts)
+                archive_pos = utf16_len(preceding_text)
+                archive_end = archive_pos + utf16_len(title)
+                rich_links.append((archive_pos, archive_end, uri))
+                para_text_parts.append(title)
+
+            elif "inlineObjectElement" in pe:
+                obj_id = pe["inlineObjectElement"].get("inlineObjectId", "")
+                obj_data = inline_objects.get(obj_id, {})
+                embedded = obj_data.get("inlineObjectProperties", {}).get("embeddedObject", {})
+                content_uri = embedded.get("imageProperties", {}).get("contentUri", "")
+                size = embedded.get("size", {})
+                height = size.get("height", {})
+                width = size.get("width", {})
+                # Position where image should be inserted (between surrounding text)
+                preceding_text = "".join(text_parts) + "".join(para_text_parts)
+                archive_pos = utf16_len(preceding_text)
+                if content_uri:
+                    images.append((archive_pos, content_uri, height, width))
+
+            elif "person" in pe:
+                p_props = pe["person"].get("personProperties", {})
+                email = p_props.get("email", "")
+                preceding_text = "".join(text_parts) + "".join(para_text_parts)
+                archive_pos = utf16_len(preceding_text)
+                if email:
+                    persons.append((archive_pos, email))
+
+        para_text = "".join(para_text_parts)
+        paragraphs.append({
+            "text": para_text,
+            "named_style": named_style,
+            "has_bullet": has_bullet,
+            "section_context": current_section,
+            "archive_start": para_archive_start,
+        })
+        text_parts.append(para_text)
+
+    full_text = "".join(text_parts)
+    return full_text, paragraphs, rich_links, images, persons
+
+
+def _merge_contiguous_ranges(ranges):
+    """Merge contiguous (start, end) ranges where one ends where the next begins."""
+    if not ranges:
+        return []
+    sorted_ranges = sorted(ranges, key=lambda r: r[0])
+    merged = [sorted_ranges[0]]
+    for start, end in sorted_ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start == prev_end:
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_archive_batch_update(full_text, paragraphs, rich_links, images, persons, tab_id, style):
+    """Build the batchUpdate JSON for inserting an entry into an archive tab.
+
+    All positions in paragraphs/rich_links/images/persons are relative to
+    the start of full_text. They get offset by base_index (1) for the tab.
+    """
+    base_index = 1
+    requests = []
+
+    # 1. Insert all text at index 1 of the target tab
+    requests.append({
+        "insertText": {
+            "location": {"index": base_index, "tabId": tab_id},
+            "text": full_text,
+        }
+    })
+
+    total_len = utf16_len(full_text)
+    text_end = base_index + total_len
+
+    # Google Docs requires endIndex to be strictly less than the segment end.
+    # After inserting text at index 1, the segment end is at least text_end + 1
+    # (the original trailing newline shifts past the inserted content), so
+    # text_end is always a valid upper bound for styling ranges.
+    para_range_end = text_end
+
+    # 2. Reset everything to NORMAL_TEXT
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": base_index, "endIndex": para_range_end, "tabId": tab_id},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Apply body font to the entire insertion range, then override headings
+    body_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    body_fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        body_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        body_fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": base_index, "endIndex": para_range_end, "tabId": tab_id},
+            "textStyle": body_text_style,
+            "fields": body_fields,
+        }
+    })
+
+    # 4. Walk paragraphs and collect heading/bullet ranges
+    heading_ranges = []
+    default_bullet_ranges = []
+    checkbox_bullet_ranges = []
+
+    cursor = base_index
+    for para in paragraphs:
+        para_text = para["text"]
+        para_start = cursor
+        para_end = cursor + utf16_len(para_text)
+        style_type = para["named_style"]
+
+        if style_type in ("HEADING_1", "HEADING_2", "HEADING_3"):
+            requests.append({
+                "updateParagraphStyle": {
+                    "range": {"startIndex": para_start, "endIndex": min(para_end, para_range_end), "tabId": tab_id},
+                    "paragraphStyle": {"namedStyleType": style_type},
+                    "fields": "namedStyleType",
+                }
+            })
+            heading_ranges.append((para_start, para_end))
+
+        if para["has_bullet"]:
+            if para["section_context"] == "open_tickets":
+                checkbox_bullet_ranges.append((para_start, para_end))
+            else:
+                default_bullet_ranges.append((para_start, para_end))
+
+        cursor = para_end
+
+    # 5. Apply bullets on contiguous ranges
+    if default_bullet_ranges:
+        for group_start, group_end in _merge_contiguous_ranges(default_bullet_ranges):
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": group_start, "endIndex": min(group_end, para_range_end), "tabId": tab_id},
+                    "bulletPreset": style["bulletPresets"]["default"],
+                }
+            })
+
+    if checkbox_bullet_ranges:
+        for group_start, group_end in _merge_contiguous_ranges(checkbox_bullet_ranges):
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": group_start, "endIndex": min(group_end, para_range_end), "tabId": tab_id},
+                    "bulletPreset": style["bulletPresets"]["checkbox"],
+                }
+            })
+
+    # 6. Override heading ranges with heading font (merged contiguous)
+    heading_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
+    }
+    heading_fields = "weightedFontFamily"
+    if style["colors"].get("headingText"):
+        heading_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["headingText"]}
+        }
+        heading_fields += ",foregroundColor"
+
+    for start, end in _merge_contiguous_ranges(heading_ranges):
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": start, "endIndex": min(end, para_range_end), "tabId": tab_id},
+                "textStyle": heading_text_style,
+                "fields": heading_fields,
+            }
+        })
+
+    # 7. RichLink hyperlinks
+    for rl_start, rl_end, uri in rich_links:
+        requests.append({
+            "updateTextStyle": {
+                "range": {
+                    "startIndex": base_index + rl_start,
+                    "endIndex": min(base_index + rl_end, para_range_end),
+                    "tabId": tab_id,
+                },
+                "textStyle": {"link": {"url": uri}},
+                "fields": "link",
+            }
+        })
+
+    # 8. Image and person insertions -- combined, sorted by index descending
+    insert_ops = []
+    for archive_pos, content_uri, height, width in images:
+        insert_ops.append({
+            "index": base_index + archive_pos,
+            "request": {
+                "insertInlineImage": {
+                    "uri": content_uri,
+                    "objectSize": {
+                        "height": height,
+                        "width": width,
+                    },
+                    "location": {"index": base_index + archive_pos, "tabId": tab_id},
+                }
+            },
+        })
+
+    for archive_pos, email in persons:
+        insert_ops.append({
+            "index": base_index + archive_pos,
+            "request": {
+                "insertPerson": {
+                    "personProperties": {"email": email},
+                    "location": {"index": base_index + archive_pos, "tabId": tab_id},
+                }
+            },
+        })
+
+    # Sort descending by index so each insertion doesn't affect later ones
+    insert_ops.sort(key=lambda x: x["index"], reverse=True)
+    for op in insert_ops:
+        requests.append(op["request"])
+
+    return {"requests": requests}
+
+
+# --- Main ---
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Archive old daily log entries to the archive document"
+    )
+    parser.add_argument(
+        "--auto-confirm",
+        action="store_true",
+        help="Automatically confirm all write operations",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be archived without doing it",
+    )
+    args = parser.parse_args()
+    auto_confirm = args.auto_confirm
+    dry_run = args.dry_run
+
+    # Step 1: Read configs
+    config, style = read_configs()
+    doc_id = config["documentId"]
+    archive_doc_id = config.get("archiveDocumentId")
+
+    if not archive_doc_id:
+        print("ERROR: archiveDocumentId not set in config/daily_log.json", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: Fetch main document
+    doc = fetch_doc(doc_id)
+
+    # Step 3: Parse entries and identify old ones
+    entries = parse_doc_entries(doc)
+    monday = get_monday_of_current_week()
+    monday_str = monday.isoformat()
+
+    old_entries = [e for e in entries if e["entry_date"] < monday_str]
+
+    if not old_entries:
+        print("Nothing to archive.")
+        return
+
+    print(f"Found {len(old_entries)} entry/entries to archive (before {monday_str}).")
+
+    # Step 4: Compute target tabs for each entry and group by week
+    # entries_by_week: {(year_title, quarter_title, week_title): {entries: [...], week_number: N}}
+    entries_by_week = {}
+
+    for entry in old_entries:
+        entry_date = date.fromisoformat(entry["entry_date"])
+        year, quarter, week_number, week_monday, week_friday = get_week_info(entry_date)
+
+        year_title = str(year)
+        quarter_title = f"{year}-Q{quarter}"
+        week_title = format_week_tab_title(week_number, week_monday, week_friday)
+
+        key = (year_title, quarter_title, week_title)
+        if key not in entries_by_week:
+            entries_by_week[key] = {"entries": [], "week_number": week_number}
+        entries_by_week[key]["entries"].append(entry)
+
+    # Print plan
+    for key in sorted(entries_by_week.keys()):
+        year_title, quarter_title, week_title = key
+        group = entries_by_week[key]
+        entry_dates = [e["heading_text"] for e in group["entries"]]
+        print(f"  {year_title} > {quarter_title} > {week_title}:")
+        for heading in entry_dates:
+            print(f"    - {heading}")
+
+    if dry_run:
+        print("\nDry-run mode: no changes made.")
+        return
+
+    # Step 5: Fetch archive document and build tab map
+    archive_doc = fetch_doc_with_tabs(archive_doc_id)
+    tab_map = build_tab_map(archive_doc.get("tabs", []))
+
+    # Step 6: Create missing tabs
+    ensure_tabs_exist(archive_doc_id, entries_by_week, tab_map, auto_confirm)
+
+    # Step 7: For each week tab, archive entries one at a time.
+    # Each entry is inserted at index 1, pushing previous content down.
+    # Insert oldest-first so the newest entry ends up on top.
+    for key in sorted(entries_by_week.keys()):
+        year_title, quarter_title, week_title = key
+        group = entries_by_week[key]
+
+        tab_id = tab_map.get(week_title)
+        if not tab_id:
+            print(f"ERROR: week tab '{week_title}' not found after creation", file=sys.stderr)
+            sys.exit(1)
+
+        week_entries = sorted(group["entries"], key=lambda e: e["entry_date"])
+
+        print(f"\nArchiving to {year_title} > {quarter_title} > {week_title}...")
+        print(f"  {len(week_entries)} entry/entries")
+
+        for entry in week_entries:
+            text, paragraphs, rich_links, images_list, persons_list = extract_entry_for_archive(
+                doc, entry["start_index"], entry["end_index"]
+            )
+
+            print(f"  Archiving {entry['heading_text']} ({utf16_len(text)} characters)...")
+
+            batch = build_archive_batch_update(
+                text, paragraphs, rich_links, images_list, persons_list, tab_id, style
+            )
+
+            success = execute_batch_update(archive_doc_id, batch, auto_confirm)
+            if not success:
+                sys.exit(2)
+
+    # Step 8: Delete archived entries from main document (bottom-to-top)
+    print("\nDeleting archived entries from main document...")
+    body_content = doc.get("body", {}).get("content", [])
+    doc_end = body_content[-1].get("endIndex", 0) if body_content else 0
+
+    entries_to_delete = sorted(old_entries, key=lambda e: e["start_index"], reverse=True)
+    delete_requests = []
+    for entry in entries_to_delete:
+        end_index = entry["end_index"]
+        # The API forbids including the final newline of the segment.
+        # If this entry spans to the document end, back off by 1.
+        if end_index >= doc_end:
+            end_index = doc_end - 1
+        delete_requests.append({
+            "deleteContentRange": {
+                "range": {
+                    "startIndex": entry["start_index"],
+                    "endIndex": end_index,
+                }
+            }
+        })
+
+    delete_batch = {"requests": delete_requests}
+    success = execute_batch_update(doc_id, delete_batch, auto_confirm)
+    if not success:
+        sys.exit(2)
+
+    # Step 9: Update cache
+    update_cache(doc_id)
+
+    # Report summary
+    print(f"\nArchive complete:")
+    print(f"  {len(old_entries)} entry/entries archived")
+    print(f"  {len(entries_by_week)} week tab(s) targeted")
+
+
+if __name__ == "__main__":
+    main()

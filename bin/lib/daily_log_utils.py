@@ -147,6 +147,19 @@ def get_cache_db():
         )
     """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS active_tickets_cache (
+            freshdesk_ticket_id INTEGER PRIMARY KEY,
+            subject TEXT,
+            requester_id INTEGER,
+            requester_name TEXT,
+            status INTEGER,
+            priority INTEGER,
+            fetched_at TEXT NOT NULL
+        )
+    """
+    )
     # Migrate: add status/priority columns if missing (pre-existing databases)
     cols = {
         row[1]

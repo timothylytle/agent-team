@@ -25,6 +25,7 @@ from lib.daily_log_utils import (
     extract_section_text,
     fetch_calendar_events,
     fetch_tasks,
+    find_last_bullet_end_in_section,
     format_event_time,
     get_cache_db,
     read_configs,
@@ -214,11 +215,16 @@ def build_batch_update(
     waiting_boundary,
     notes_end_index,
     style,
+    inherit_priority_bullet=False,
 ):
     """Build the batchUpdate JSON.
 
     This may write to both the Task List section (priorities + waiting/blockers)
     and the Notes section (new HEADING_3 sub-sections).
+
+    When inherit_priority_bullet is True, priority items are inserted before the
+    trailing newline of the last existing bullet paragraph. New paragraphs
+    inherit bullet membership, paragraph style, and font styling automatically.
 
     CRITICAL: Google Docs batchUpdate processes requests sequentially. When
     inserting text, all indices after the insertion point shift. We must process
@@ -422,15 +428,26 @@ def build_batch_update(
 
     # --- New priority items ---
     if new_priority_entries:
-        priority_text = ""
+        priority_lines = []
         for item, item_type in new_priority_entries:
             if item_type == "event":
                 time_str = format_event_time(item)
-                priority_text += f"(event) {item['summary']} {time_str}\n"
+                priority_lines.append(f"(event) {item['summary']} {time_str}")
             else:
-                priority_text += f"(task) {item['title']}\n"
+                priority_lines.append(f"(task) {item['title']}")
+
+        if inherit_priority_bullet:
+            # Inheritance path: leading \n splits existing paragraph, no trailing \n
+            priority_text = "\n" + "\n".join(priority_lines)
+        else:
+            # Fallback path: trailing \n for each line
+            priority_text = "\n".join(priority_lines) + "\n"
 
         def priority_formatting(base_index, text):
+            if inherit_priority_bullet:
+                # All formatting inherited from existing bullet paragraph
+                return []
+
             reqs = []
             text_end = base_index + utf16_len(text)
 
@@ -663,7 +680,16 @@ def main():
             print(f"  {title}")
 
     # Step 6: Find insertion points
+    # Strategy B: inherit bullet list membership from existing priority bullets
+    inherit_priority_bullet = False
     priorities_insert_index = find_priorities_insertion_point(doc, tl_start, tl_end)
+    if priorities_insert_index is not None and new_priority_entries:
+        last_priority_bullet = find_last_bullet_end_in_section(
+            doc, tl_start, priorities_insert_index
+        )
+        if last_priority_bullet:
+            priorities_insert_index = last_priority_bullet - 1  # before trailing \n
+            inherit_priority_bullet = True
     if priorities_insert_index is None and new_priority_entries:
         print(
             "ERROR: could not find 'Waiting / Blockers:' label in Task List section",
@@ -693,6 +719,7 @@ def main():
         waiting_boundary=waiting_boundary,
         notes_end_index=notes_end,
         style=style,
+        inherit_priority_bullet=inherit_priority_bullet,
     )
 
     if batch is None:

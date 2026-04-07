@@ -913,6 +913,20 @@ def sort_entries(events, tasks):
 # --- Time formatting ---
 
 
+def find_last_bullet_end_in_section(doc, section_start, section_end):
+    """Find the endIndex of the last bulleted paragraph in a section."""
+    body_content = doc.get("body", {}).get("content", [])
+    last_bullet_end = None
+    for element in body_content:
+        el_start = element.get("startIndex", 0)
+        if el_start < section_start or el_start >= section_end:
+            continue
+        paragraph = element.get("paragraph", {})
+        if paragraph.get("bullet"):
+            last_bullet_end = element.get("endIndex")
+    return last_bullet_end
+
+
 def format_event_time(event):
     """Format an event's time for display. Returns 'all day' or 'h:mm AM/PM'."""
     if event["all_day"]:

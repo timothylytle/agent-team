@@ -190,7 +190,11 @@ def resolve_crm_entity(email, contacts_cache=None, companies_cache=None):
                     if co["id"] == result["company_id"]:
                         result["company_name"] = co.get("name", "")
                         break
-            return result
+            # If contact has a company, we're done. If not, fall through
+            # to domain matching so we can still resolve the company.
+            if result["company_id"]:
+                return result
+            break
 
     # Step 2: Search companies by domain
     if not domain:

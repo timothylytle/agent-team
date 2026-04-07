@@ -438,6 +438,26 @@ cmd_contacts_view() {
   exit "$rc"
 }
 
+cmd_agents_view() {
+  if (( $# < 1 )); then
+    deny "agents view requires an agent ID"
+  fi
+
+  local agent_id="$1"; shift
+  [[ -z "$agent_id" ]] && deny "agent ID must not be empty"
+  [[ "$agent_id" =~ ^[0-9]+$ ]] || deny "agent ID must be numeric"
+
+  if (( $# > 0 )); then
+    deny "unknown option for agents view: $1"
+  fi
+
+  log_entry "$CMD_STR" "ALLOWED"
+  local rc=0
+  api_call GET "/agents/${agent_id}" || rc=$?
+  log_entry "$CMD_STR" "ALLOWED" "$rc"
+  exit "$rc"
+}
+
 # --- Usage ---
 
 usage() {
@@ -452,6 +472,7 @@ Commands:
   tickets note-update TICKET_ID NOTE_ID --body "new body" [--confirmed NONCE]
   contacts list   [--page N] [--per_page N]
   contacts view   ID
+  agents view     ID
 
 All other operations are blocked.
 USAGE
@@ -487,6 +508,7 @@ main() {
     tickets:note-update) load_config; cmd_tickets_note_update "$@" ;;
     contacts:list)   load_config; cmd_contacts_list "$@" ;;
     contacts:view)   load_config; cmd_contacts_view "$@" ;;
+    agents:view)     load_config; cmd_agents_view "$@" ;;
     *)
       deny "command '${resource} ${action}' is not in the allowlist"
       ;;

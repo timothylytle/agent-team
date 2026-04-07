@@ -29,7 +29,7 @@ from lib.support_utils import (
     read_style_config,
 )
 
-SHARED_DRIVE_NAME = "Devops"
+SHARED_DRIVE_NAME = "DevOps"
 
 
 def eprint(*args, **kwargs):

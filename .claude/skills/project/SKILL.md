@@ -144,7 +144,8 @@ Once the user approves the full scope:
    - Find the end index of each section heading (Problem Statement, Desired Outcome, etc.)
    - Use `gws-safe docs documents batchUpdate` to insert the approved content after each heading
    - Insert content in reverse document order (highest index first) so earlier insertions don't shift later indices
-   - Use `--auto-confirm` for all GWS write operations called within this flow
+   - **CRITICAL: Inserted text inherits the paragraph style of the heading it follows.** After inserting content, you MUST apply `updateParagraphStyle` with `namedStyleType: "NORMAL_TEXT"` to every inserted content paragraph. Without this, all content will render as headings. Only research topic sub-headings should retain `HEADING_2` style.
+   - Use `auto_confirm_gws()` from `lib/support_utils` for all GWS write operations (not `--auto-confirm` as a CLI flag)
 
 5. Present the Google Doc link to the user.
 
@@ -206,8 +207,9 @@ Once the user approves:
 
 1. Read the doc again to get current indices: `gws-safe docs documents get --params '{"documentId":"DOC_ID"}'`
 2. Find the insertion point for the research topic (after the topic's H2 heading)
-3. Use `gws-safe docs documents batchUpdate` with `--auto-confirm` to insert the findings content
-4. If the topic is new, first insert a new H2 heading under "Research Topics", then insert the content
+3. Use `gws-safe docs documents batchUpdate` via `auto_confirm_gws()` to insert the findings content
+4. **CRITICAL: Inserted text inherits the heading style.** After inserting, apply `updateParagraphStyle` with `namedStyleType: "NORMAL_TEXT"` to all inserted content paragraphs so they don't render as headings.
+5. If the topic is new, first insert a new H2 heading under "Research Topics", then insert the content below it
 
 ### Step 8: Update CRM status
 

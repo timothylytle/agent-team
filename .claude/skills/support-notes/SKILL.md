@@ -45,3 +45,18 @@ After the script completes, report what it printed. The script outputs a full su
 - Number of tagged notes injected
 - Any skipped tickets (with reasons)
 - Any errors encountered
+
+## Handle skipped tickets (No CRM company resolved)
+
+If any tickets were skipped with reason "No CRM company resolved", present them to the user and ask if they want to create CRM company records:
+
+1. For each skipped ticket, show: ticket ID, subject, requester name, requester email, and the email domain
+2. Ask the user: "Would you like to create a CRM company for [domain]? If so, what should the company name be?"
+3. If the user provides a company name, create the CRM company:
+   ```bash
+   bin/crm-safe companies create --json '{"name": "<company_name>", "domains": ["<domain>"]}'
+   ```
+4. After creating the company, re-run the support-notes script to process the previously skipped tickets:
+   ```bash
+   /home/timothylytle/agent-team/bin/update-support-notes --auto-confirm
+   ```

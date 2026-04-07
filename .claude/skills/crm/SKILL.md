@@ -59,6 +59,16 @@ Only the operations listed below are permitted. If an operation is not listed he
 - `crm-safe emails view ID` — view a single email
 - `crm-safe emails create --json '{"gmail_message_id":"...","sender_email":"...","sender_name":"...","subject":"...","gmail_url":"...","received_at":"...","contact_id":1,"company_id":1}'` — create email record (gmail_message_id required)
 
+### Projects (read + write)
+
+- `crm-safe projects list` — list all projects
+- `crm-safe projects list --company-id ID` — list projects for a specific company
+- `crm-safe projects list --status-id ID` — list projects with a specific status
+- `crm-safe projects list --company-id ID --status-id ID` — combine filters
+- `crm-safe projects view ID` — view a single project
+- `crm-safe projects create --json '{"name":"New Feature","project_code":"NF-001","status_id":1,"company_id":1,"summary":"...","priority":2,"tags":["api"],"start_date":"2026-04-07","due_date":"2026-05-01"}'` — create a project (write, `name` required)
+- `crm-safe projects update ID --json '{"status_id":3,"priority":1}'` — update a project (write)
+
 ### Files (read + create + link/unlink)
 
 - `crm-safe files list` — list all drive files
@@ -98,6 +108,13 @@ Key fields: `id`, `google_event_id`, `ticket_id` (FK to tickets), `contact_id` (
 
 ### emails
 Key fields: `id`, `gmail_message_id`, `contact_id` (FK), `company_id` (FK), `sender_email`, `sender_name`, `subject`, `gmail_url`, `received_at`
+
+### project_statuses
+Lookup table: `status_id`, `name`
+Values: (1, 'Scoping'), (2, 'Researching'), (3, 'Implementing'), (4, 'Complete')
+
+### projects
+Key fields: `id`, `name`, `project_code` (unique), `status_id` (FK to project_statuses), `company_id` (FK to companies), `summary`, `google_doc_id`, `google_doc_url`, `priority` (1-4), `tags` (JSON array), `start_date`, `due_date`
 
 ### company_files
 Junction table: `company_id` (FK to companies), `file_id` (FK to drive_files), `linked_at`

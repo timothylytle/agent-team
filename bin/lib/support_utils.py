@@ -84,8 +84,8 @@ def fetch_active_tickets():
 
     results = data.get("results", [])
 
-    # Filter to agent-assigned tickets
-    assigned = [t for t in results if t.get("agent_id")]
+    # Filter to agent-assigned tickets (FreshDesk search returns responder_id, not agent_id)
+    assigned = [t for t in results if t.get("responder_id")]
 
     if not assigned:
         # Store sentinel row for cache

@@ -25,6 +25,7 @@ from lib.daily_log_utils import (
     GWS_SAFE,
     execute_batch_update,
     extract_section_text,
+    find_last_bullet_end_in_section,
     get_cache_db,
     read_configs,
     run_cmd,
@@ -420,18 +421,26 @@ def parse_existing_entries(section_text):
 from lib.daily_log_utils import fetch_doc  # noqa: E402
 
 
-def build_batch_update(email_lines, section_end, style):
+def build_batch_update(email_lines, insert_index, style, inherit_bullet=False):
     """Build the batchUpdate JSON for inserting email lines.
 
-    Inserts at section_end (the startIndex of the next section heading).
-    Each line: [Sender Name] Subject\n
-    Then applies checkbox bullets, font styling, and Gmail links.
-
+    Each line: [Sender Name] Subject
     email_lines is a list of (line_text, gmail_url) tuples.
+
+    When inherit_bullet is True, inserts at last_bullet_end - 1 (before the
+    existing paragraph's trailing newline). New paragraphs inherit bullet
+    membership, paragraph style, and font styling automatically. Only Gmail
+    link styling is applied explicitly.
+
+    When inherit_bullet is False (fallback), inserts at section_end with
+    explicit paragraph style, bullet creation, font styling, and links.
     """
     line_texts = [line for line, _ in email_lines]
-    insert_text = "\n".join(line_texts) + "\n"
-    insert_index = section_end
+
+    if inherit_bullet:
+        insert_text = "\n" + "\n".join(line_texts)
+    else:
+        insert_text = "\n".join(line_texts) + "\n"
 
     requests = []
 
@@ -443,59 +452,68 @@ def build_batch_update(email_lines, section_end, style):
         }
     })
 
-    # 2. Reset paragraph style to NORMAL_TEXT
-    text_start = insert_index
-    text_end = insert_index + utf16_len(insert_text)
+    if not inherit_bullet:
+        # Fallback: explicit paragraph style, bullets, and font styling
+        text_start = insert_index
+        text_end = insert_index + utf16_len(insert_text)
 
-    requests.append({
-        "updateParagraphStyle": {
-            "range": {
-                "startIndex": text_start,
-                "endIndex": text_end,
-            },
-            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
-            "fields": "namedStyleType",
+        # 2. Reset paragraph style to NORMAL_TEXT
+        requests.append({
+            "updateParagraphStyle": {
+                "range": {
+                    "startIndex": text_start,
+                    "endIndex": text_end,
+                },
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType",
+            }
+        })
+
+        # 3. Apply checkbox bullets
+        requests.append({
+            "createParagraphBullets": {
+                "range": {
+                    "startIndex": text_start,
+                    "endIndex": text_end,
+                },
+                "bulletPreset": style["bulletPresets"]["checkbox"],
+            }
+        })
+
+        # 4. Apply font styling
+        text_style = {
+            "weightedFontFamily": {
+                "fontFamily": style["fonts"]["body"],
+            }
         }
-    })
+        fields = "weightedFontFamily"
 
-    # 3. Apply checkbox bullets
-    requests.append({
-        "createParagraphBullets": {
-            "range": {
-                "startIndex": text_start,
-                "endIndex": text_end,
-            },
-            "bulletPreset": style["bulletPresets"]["checkbox"],
-        }
-    })
+        if style["colors"].get("bodyText"):
+            text_style["foregroundColor"] = {
+                "color": {"rgbColor": style["colors"]["bodyText"]}
+            }
+            fields += ",foregroundColor"
 
-    # 4. Apply font styling
-    text_style = {
-        "weightedFontFamily": {
-            "fontFamily": style["fonts"]["body"],
-        }
-    }
-    fields = "weightedFontFamily"
+        requests.append({
+            "updateTextStyle": {
+                "range": {
+                    "startIndex": text_start,
+                    "endIndex": text_end,
+                },
+                "textStyle": text_style,
+                "fields": fields,
+            }
+        })
 
-    if style["colors"].get("bodyText"):
-        text_style["foregroundColor"] = {
-            "color": {"rgbColor": style["colors"]["bodyText"]}
-        }
-        fields += ",foregroundColor"
+    # Apply Gmail links to each line
+    # In inheritance mode, the leading \n occupies the first position, so
+    # the first line of text starts at insert_index + utf16_len("\n").
+    # In fallback mode, the first line starts at insert_index.
+    if inherit_bullet:
+        cursor = insert_index + utf16_len("\n")
+    else:
+        cursor = insert_index
 
-    requests.append({
-        "updateTextStyle": {
-            "range": {
-                "startIndex": text_start,
-                "endIndex": text_end,
-            },
-            "textStyle": text_style,
-            "fields": fields,
-        }
-    })
-
-    # 5. Apply Gmail links to each line
-    cursor = insert_index
     for line_text, gmail_url in email_lines:
         line_start = cursor
         line_end = cursor + utf16_len(line_text)
@@ -657,7 +675,15 @@ def main():
         print(f"  {line}")
 
     # Step 10: Build and execute batchUpdate
-    batch = build_batch_update(email_lines, section_end, style)
+    # Strategy B: inherit bullet list membership from existing bullets
+    last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
+    if last_bullet:
+        insert_index = last_bullet - 1  # before the trailing \n
+        inherit_bullet = True
+    else:
+        insert_index = section_end  # fallback: no existing bullets
+        inherit_bullet = False
+    batch = build_batch_update(email_lines, insert_index, style, inherit_bullet)
     success = execute_batch_update(doc_id, batch, auto_confirm)
 
     if not success:

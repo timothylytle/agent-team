@@ -108,7 +108,18 @@ def build_batch_update(new_tickets, insert_index, style, inherit_bullet=False):
         }
     })
 
-    if not inherit_bullet:
+    if inherit_bullet:
+        # Clear strikethrough that may be inherited from checked checkboxes
+        text_start = insert_index + utf16_len("\n")
+        text_end = insert_index + utf16_len(insert_text)
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": text_start, "endIndex": text_end},
+                "textStyle": {"strikethrough": False},
+                "fields": "strikethrough",
+            }
+        })
+    else:
         # Fallback: explicit paragraph style, bullets, and font styling
         text_start = insert_index
         text_end = insert_index + utf16_len(insert_text)

@@ -445,8 +445,17 @@ def build_batch_update(
 
         def priority_formatting(base_index, text):
             if inherit_priority_bullet:
-                # All formatting inherited from existing bullet paragraph
-                return []
+                # Clear strikethrough that may be inherited from checked checkboxes
+                # Skip the leading \n (first code unit) to target only new text
+                content_start = base_index + utf16_len("\n")
+                text_end = base_index + utf16_len(text)
+                return [{
+                    "updateTextStyle": {
+                        "range": {"startIndex": content_start, "endIndex": text_end},
+                        "textStyle": {"strikethrough": False},
+                        "fields": "strikethrough",
+                    }
+                }]
 
             reqs = []
             text_end = base_index + utf16_len(text)

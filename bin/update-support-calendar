@@ -41,7 +41,7 @@ from lib.support_utils import (
 # --- Constants ---
 
 SUPPORT_COLOR_IDS = {"4", "11"}
-DEFAULT_SUMMARY_RE = re.compile(r"^\d+min Support Session \(.*\)$")
+DEFAULT_SUMMARY_RE = re.compile(r"^\d+\s*min Support Session \(.*\)$")
 FRESHDESK_LINK_MARKER = "miarec.freshdesk.com/a/tickets/"
 
 

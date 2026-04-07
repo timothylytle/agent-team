@@ -98,6 +98,9 @@ CREATE TABLE tickets (
     custom_fields   TEXT,                   -- JSON object
     due_by          TEXT,                   -- ISO 8601
     is_escalated    INTEGER DEFAULT 0 CHECK (is_escalated IN (0, 1)),
+    resolved_at     TEXT,                   -- ISO 8601, from FreshDesk stats
+    closed_at       TEXT,                   -- ISO 8601, from FreshDesk stats
+    resolution_summary TEXT,                -- LLM-generated 2-3 sentence summary
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );

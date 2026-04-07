@@ -385,7 +385,8 @@ def cmd_tickets_create(args, cmd_str):
     vals = []
     allowed = ('subject', 'status', 'priority', 'source', 'type', 'company_id',
                'requester_id', 'responder_id', 'group_id', 'product_id', 'tags',
-               'custom_fields', 'due_by', 'is_escalated', 'freshdesk_id')
+               'custom_fields', 'due_by', 'is_escalated', 'freshdesk_id',
+               'resolved_at', 'closed_at', 'resolution_summary')
     for k in allowed:
         if k in data:
             cols.append(k)
@@ -420,7 +421,8 @@ def cmd_tickets_update(args, cmd_str):
         sys.exit(1)
     allowed = ('subject', 'status', 'priority', 'source', 'type', 'company_id',
                'requester_id', 'responder_id', 'group_id', 'product_id', 'tags',
-               'custom_fields', 'due_by', 'is_escalated', 'freshdesk_id')
+               'custom_fields', 'due_by', 'is_escalated', 'freshdesk_id',
+               'resolved_at', 'closed_at', 'resolution_summary')
     sets = []
     vals = []
     for k in allowed:

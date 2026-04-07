@@ -317,7 +317,9 @@ def create_google_doc(support_folder_id, doc_name, auto_confirm):
         return None, None, False
     try:
         data = json.loads(stdout)
-        return data["id"], data.get("webViewLink", ""), True
+        doc_id = data["id"]
+        web_view_link = data.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}"
+        return doc_id, web_view_link, True
     except (json.JSONDecodeError, KeyError):
         return None, None, False
 

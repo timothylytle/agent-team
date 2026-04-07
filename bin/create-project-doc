@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Create a project scope Google Doc in the Devops Shared Drive.
+
+Creates a folder structure: Devops > projects > {project-code} > "Scope -- {project-code}"
+and populates the doc with the project template structure.
+
+Usage:
+    bin/create-project-doc --name "API Refactor" --project-code 2026q2_api-refactor [--author "Timothy Lytle"] [--auto-confirm]
+"""
+
+import argparse
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    GWS_SAFE,
+    run_cmd,
+    utf16_len,
+)
+from lib.support_utils import (
+    auto_confirm_gws,
+    build_paragraph_style_request,
+    build_text_style_request,
+    read_style_config,
+)
+
+SHARED_DRIVE_NAME = "DevOps"
+
+
+def eprint(*args, **kwargs):
+    """Print to stderr."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+# --- Shared Drive operations ---
+
+
+def find_shared_drive():
+    """Find the Devops Shared Drive. Returns drive_id or exits."""
+    eprint("Finding Devops Shared Drive...")
+    stdout, _, _ = run_cmd([GWS_SAFE, "drive", "drives", "list"])
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        eprint("ERROR: failed to parse drives list output")
+        sys.exit(1)
+
+    for drive in data.get("drives", []):
+        if drive.get("name") == SHARED_DRIVE_NAME:
+            drive_id = drive["id"]
+            eprint(f"  Found Shared Drive: {drive_id}")
+            return drive_id
+
+    eprint(f"ERROR: Shared Drive '{SHARED_DRIVE_NAME}' not found")
+    sys.exit(1)
+
+
+def find_folder(drive_id, parent_id, folder_name):
+    """Find a folder by name under a parent. Returns folder_id or None."""
+    params = {
+        "q": f"name='{folder_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        "driveId": drive_id,
+        "corpora": "drive",
+        "includeItemsFromAllDrives": True,
+        "supportsAllDrives": True,
+    }
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "drive", "files", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+    files = data.get("files", [])
+    if files:
+        return files[0]["id"]
+    return None
+
+
+def create_folder(parent_id, folder_name, auto_confirm):
+    """Create a subfolder. Returns (folder_id, success)."""
+    cmd_args = [
+        "drive", "files", "create",
+        "--params", json.dumps({"supportsAllDrives": True}),
+        "--json", json.dumps({
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }),
+    ]
+    stdout, success = auto_confirm_gws(cmd_args, auto_confirm, f"Create folder '{folder_name}'")
+    if not success:
+        return None, False
+    try:
+        data = json.loads(stdout)
+        return data["id"], True
+    except (json.JSONDecodeError, KeyError):
+        return None, False
+
+
+def create_google_doc(folder_id, doc_name, auto_confirm):
+    """Create a Google Doc in the given folder. Returns (doc_id, web_view_link, success)."""
+    cmd_args = [
+        "drive", "files", "create",
+        "--params", json.dumps({"supportsAllDrives": True}),
+        "--json", json.dumps({
+            "name": doc_name,
+            "mimeType": "application/vnd.google-apps.document",
+            "parents": [folder_id],
+        }),
+    ]
+    stdout, success = auto_confirm_gws(cmd_args, auto_confirm, f"Create doc '{doc_name}'")
+    if not success:
+        return None, None, False
+    try:
+        data = json.loads(stdout)
+        doc_id = data["id"]
+        web_view_link = data.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}"
+        return doc_id, web_view_link, True
+    except (json.JSONDecodeError, KeyError):
+        return None, None, False
+
+
+def populate_doc(doc_id, name, project_code, author, issue_date, style, auto_confirm):
+    """Populate the project doc with template structure."""
+
+    # Build the document content lines and their intended styles.
+    # Format: (text, paragraph_style, is_heading_font)
+    # paragraph_style: "HEADING_1", "HEADING_2", "NORMAL_TEXT"
+    # For metadata lines, we'll handle bold labels separately.
+    content = [
+        # Metadata block
+        (f"Project Title: {name}", "NORMAL_TEXT", False),
+        (f"Project Code: {project_code}", "NORMAL_TEXT", False),
+        (f"Author: {author}", "NORMAL_TEXT", False),
+        (f"Issue Date: {issue_date}", "NORMAL_TEXT", False),
+        # Blank line after metadata
+        ("", "NORMAL_TEXT", False),
+        # Sections
+        ("Overview", "HEADING_1", True),
+        ("Problem Statement", "HEADING_2", True),
+        ("Desired Outcome", "HEADING_2", True),
+        ("Scope", "HEADING_1", True),
+        ("In Scope", "HEADING_2", True),
+        ("Out of Scope", "HEADING_2", True),
+        ("Constraints / Assumptions", "HEADING_2", True),
+        ("Current State", "HEADING_1", True),
+        ("Success Criteria", "HEADING_1", True),
+        ("References", "HEADING_1", True),
+        ("Deliverables / Milestones", "HEADING_1", True),
+        ("Research Topics", "HEADING_1", True),
+        ("Implementation Log", "HEADING_1", True),
+    ]
+
+    lines = [text for text, _, _ in content]
+    insert_text = "\n".join(lines) + "\n"
+
+    requests = []
+
+    # 1. Insert all text at index 1
+    requests.append({
+        "insertText": {
+            "location": {"index": 1},
+            "text": insert_text,
+        }
+    })
+
+    # 2. Calculate indices for formatting
+    idx = 1
+    line_ranges = []
+    for line in lines:
+        line_len = utf16_len(line)
+        line_start = idx
+        line_end = idx + line_len
+        para_end = line_end + 1  # +1 for \n
+        line_ranges.append((line_start, line_end, para_end))
+        idx = para_end
+
+    # 3. Apply paragraph and text styles
+    for i, (text, para_style, is_heading) in enumerate(content):
+        line_start, line_end, para_end = line_ranges[i]
+
+        # Paragraph style
+        requests.append(build_paragraph_style_request(line_start, para_end, para_style))
+
+        # Text style (only for non-empty lines)
+        if line_end > line_start:
+            requests.append(build_text_style_request(line_start, line_end, style, is_heading=is_heading))
+
+    # 4. Bold the metadata labels
+    metadata_labels = [
+        (0, "Project Title:"),
+        (1, "Project Code:"),
+        (2, "Author:"),
+        (3, "Issue Date:"),
+    ]
+    for line_idx, label in metadata_labels:
+        label_start = line_ranges[line_idx][0]
+        label_end = label_start + utf16_len(label)
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": label_start, "endIndex": label_end},
+                "textStyle": {"bold": True},
+                "fields": "bold",
+            }
+        })
+
+    # Execute batchUpdate
+    batch = {"requests": requests}
+    cmd_args = [
+        "docs", "documents", "batchUpdate",
+        "--json", json.dumps(batch),
+        "--params", json.dumps({"documentId": doc_id}),
+    ]
+    _, success = auto_confirm_gws(cmd_args, auto_confirm, "Populate project doc")
+    return success
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create a project scope Google Doc in the Devops Shared Drive"
+    )
+    parser.add_argument(
+        "--name", required=True,
+        help="Project name/title",
+    )
+    parser.add_argument(
+        "--project-code", required=True,
+        help="Unique project code (e.g., 2026q2_api-refactor)",
+    )
+    parser.add_argument(
+        "--author", default="Timothy Lytle",
+        help="Author name (default: Timothy Lytle)",
+    )
+    parser.add_argument(
+        "--auto-confirm", action="store_true",
+        help="Automatically confirm all write operations",
+    )
+    args = parser.parse_args()
+
+    project_code = args.project_code
+    name = args.name
+    author = args.author
+    auto_confirm = args.auto_confirm
+    issue_date = date.today().strftime("%Y-%m-%d")
+
+    # Step 0: Read style config
+    style = read_style_config()
+    eprint("Loaded style configuration")
+
+    # Step 1: Find the Devops Shared Drive
+    drive_id = find_shared_drive()
+
+    # Step 2: Find the "projects" folder
+    eprint("Looking for 'projects' folder...")
+    projects_folder_id = find_folder(drive_id, drive_id, "projects")
+    if not projects_folder_id:
+        eprint("ERROR: 'projects' folder not found in Devops Shared Drive")
+        sys.exit(1)
+    eprint(f"  Found 'projects' folder: {projects_folder_id}")
+
+    # Step 3: Find or create the project-code subfolder
+    eprint(f"Looking for '{project_code}' folder...")
+    project_folder_id = find_folder(drive_id, projects_folder_id, project_code)
+    if project_folder_id:
+        eprint(f"  Found existing folder: {project_folder_id}")
+    else:
+        eprint(f"  Creating '{project_code}' folder...")
+        project_folder_id, success = create_folder(projects_folder_id, project_code, auto_confirm)
+        if not success or not project_folder_id:
+            eprint("ERROR: failed to create project folder")
+            sys.exit(1)
+        eprint(f"  Created folder: {project_folder_id}")
+
+    # Step 4: Create the Google Doc
+    doc_name = f"Scope \u2014 {project_code}"
+    eprint(f"Creating doc '{doc_name}'...")
+    doc_id, web_view_link, success = create_google_doc(project_folder_id, doc_name, auto_confirm)
+    if not success or not doc_id:
+        eprint("ERROR: failed to create Google Doc")
+        sys.exit(1)
+    eprint(f"  Created doc: {doc_id}")
+
+    # Step 5: Populate the template
+    eprint("Populating doc template...")
+    format_success = populate_doc(doc_id, name, project_code, author, issue_date, style, auto_confirm)
+    if not format_success:
+        eprint("WARNING: doc formatting may be incomplete")
+
+    # Output JSON result to stdout
+    result = {
+        "document_id": doc_id,
+        "url": web_view_link,
+        "folder_id": project_folder_id,
+    }
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

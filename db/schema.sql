@@ -189,3 +189,44 @@ CREATE INDEX idx_emails_gmail_message_id ON emails(gmail_message_id);
 CREATE INDEX idx_emails_contact_id ON emails(contact_id) WHERE contact_id IS NOT NULL;
 CREATE INDEX idx_emails_company_id ON emails(company_id) WHERE company_id IS NOT NULL;
 CREATE INDEX idx_emails_received_at ON emails(received_at) WHERE received_at IS NOT NULL;
+
+-- ============================================================
+-- Project statuses
+-- Lookup table for project status codes.
+-- ============================================================
+CREATE TABLE project_statuses (
+    status_id   INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL
+);
+
+INSERT INTO project_statuses (status_id, name) VALUES
+    (1, 'Scoping'),
+    (2, 'Researching'),
+    (3, 'Implementing'),
+    (4, 'Complete');
+
+-- ============================================================
+-- Projects
+-- Development projects linked to companies. Tracked with
+-- Google Docs and tagged by priority and status.
+-- ============================================================
+CREATE TABLE projects (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    project_code    TEXT UNIQUE NOT NULL,
+    status_id       INTEGER REFERENCES project_statuses(status_id),
+    company_id      INTEGER REFERENCES companies(id),
+    summary         TEXT,
+    google_doc_id   TEXT,
+    google_doc_url  TEXT,
+    priority        INTEGER CHECK (priority BETWEEN 1 AND 4),
+    tags            TEXT,                   -- JSON array
+    start_date      TEXT,                   -- ISO 8601
+    due_date        TEXT,                   -- ISO 8601
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_projects_project_code ON projects(project_code);
+CREATE INDEX idx_projects_company_id ON projects(company_id) WHERE company_id IS NOT NULL;
+CREATE INDEX idx_projects_status_id ON projects(status_id) WHERE status_id IS NOT NULL;

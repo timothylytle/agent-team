@@ -726,6 +726,117 @@ def cmd_files_unlink(args, cmd_str):
     log_entry(cmd_str, 'CONFIRMED', 0)
 
 
+# --- Command: projects ---
+
+def cmd_projects_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    query = (
+        'SELECT p.*, ps.name AS status_name, c.name AS company_name '
+        'FROM projects p '
+        'LEFT JOIN project_statuses ps ON p.status_id = ps.status_id '
+        'LEFT JOIN companies c ON p.company_id = c.id'
+    )
+    params = []
+    conditions = []
+    if args.company_id is not None:
+        conditions.append('p.company_id = ?')
+        params.append(args.company_id)
+    if args.status_id is not None:
+        conditions.append('p.status_id = ?')
+        params.append(args.status_id)
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    query += ' ORDER BY p.created_at DESC'
+    rows = db.execute(query, params).fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_projects_view(args, cmd_str):
+    if args.id is None:
+        deny('projects view requires an ID', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute('SELECT * FROM projects WHERE id = ?', (args.id,)).fetchone()
+    if not row:
+        output_json({'error': f'project {args.id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    output_json(dict(row))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_projects_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if 'name' not in data or not data['name']:
+        deny('projects create requires "name" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create project', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('name', 'project_code', 'status_id', 'company_id', 'summary',
+               'google_doc_id', 'google_doc_url', 'priority', 'tags',
+               'start_date', 'due_date')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO projects ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM projects WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+def cmd_projects_update(args, cmd_str):
+    if args.id is None:
+        deny('projects update requires an ID', cmd_str)
+    data = _parse_json_arg(args, cmd_str)
+    if not data:
+        deny('projects update requires at least one field in JSON', cmd_str)
+    _write_gate(args, cmd_str, f'Update project {args.id}', data)
+    db = get_db()
+    existing = db.execute('SELECT id FROM projects WHERE id = ?', (args.id,)).fetchone()
+    if not existing:
+        output_json({'error': f'project {args.id} not found'})
+        sys.exit(1)
+    allowed = ('name', 'project_code', 'status_id', 'company_id', 'summary',
+               'google_doc_id', 'google_doc_url', 'priority', 'tags',
+               'start_date', 'due_date')
+    sets = []
+    vals = []
+    for k in allowed:
+        if k in data:
+            sets.append(f'{k} = ?')
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    if not sets:
+        deny('no valid fields to update', cmd_str)
+    sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+    vals.append(args.id)
+    try:
+        db.execute(f'UPDATE projects SET {", ".join(sets)} WHERE id = ?', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM projects WHERE id = ?', (args.id,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
 # --- Helpers ---
 
 def _parse_json_arg(args, cmd_str):
@@ -765,6 +876,9 @@ def _build_cmd_str(args):
     if getattr(args, 'contact_id', None) is not None:
         parts.append('--contact-id')
         parts.append(str(args.contact_id))
+    if getattr(args, 'status_id', None) is not None:
+        parts.append('--status-id')
+        parts.append(str(args.status_id))
     return ' '.join(parts)
 
 
@@ -782,7 +896,7 @@ def build_parser():
         prog='crm-safe',
         description='Safe CRM database wrapper',
     )
-    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files', 'meetings', 'emails'])
+    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files', 'meetings', 'emails', 'projects'])
     parser.add_argument('action')
     parser.add_argument('id', nargs='?', type=int, default=None)
     parser.add_argument('--json', dest='json', default=None)
@@ -791,6 +905,7 @@ def build_parser():
     parser.add_argument('--status', type=int, default=None)
     parser.add_argument('--ticket-id', type=int, default=None)
     parser.add_argument('--contact-id', type=int, default=None)
+    parser.add_argument('--status-id', type=int, default=None)
     parser.add_argument('--confirmed', default=None)
     return parser
 
@@ -817,6 +932,10 @@ ROUTES = {
     'emails:list': cmd_emails_list,
     'emails:view': cmd_emails_view,
     'emails:create': cmd_emails_create,
+    'projects:list': cmd_projects_list,
+    'projects:view': cmd_projects_view,
+    'projects:create': cmd_projects_create,
+    'projects:update': cmd_projects_update,
     'files:list': cmd_files_list,
     'files:create': cmd_files_create,
     'files:link': cmd_files_link,

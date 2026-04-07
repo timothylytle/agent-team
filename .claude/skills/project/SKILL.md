@@ -145,6 +145,11 @@ Once the user approves the full scope:
    - Use `gws-safe docs documents batchUpdate` to insert the approved content after each heading
    - Insert content in reverse document order (highest index first) so earlier insertions don't shift later indices
    - **CRITICAL: Inserted text inherits the paragraph style of the heading it follows.** After inserting content, you MUST apply `updateParagraphStyle` with `namedStyleType: "NORMAL_TEXT"` to every inserted content paragraph. Without this, all content will render as headings. Only research topic sub-headings should retain `HEADING_2` style.
+   - **List formatting:** After setting NORMAL_TEXT, apply `createParagraphBullets` to list-style sections:
+     - **Bullet lists** (`BULLET_DISC_CIRCLE_SQUARE`): In Scope, Out of Scope, Constraints / Assumptions, Success Criteria
+     - **Checkbox lists** (`BULLET_CHECKBOX`): Deliverables / Milestones
+     - Paragraph sections (Problem Statement, Desired Outcome, Current State) should remain plain NORMAL_TEXT with no bullets.
+   - **Font:** Apply `updateTextStyle` with `weightedFontFamily: {"fontFamily": "Roboto", "weight": 400}` to all inserted content. The body font is defined in `config/doc_styles.json` as "Roboto". Without this, inserted text defaults to Arial.
    - Use `auto_confirm_gws()` from `lib/support_utils` for all GWS write operations (not `--auto-confirm` as a CLI flag)
 
 5. Present the Google Doc link to the user.

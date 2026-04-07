@@ -13,13 +13,11 @@ Run the script:
 bin/create-daily-log --auto-confirm
 ```
 
-Optionally pass a historical fact about today's date:
+Before running the script, use a web search to find an interesting historical fact about today's date. Always pass it with `--fact`:
 
 ```bash
-bin/create-daily-log --auto-confirm --fact "On this day in 1969, the Apollo 11 mission launched."
+bin/create-daily-log --auto-confirm --fact "On this day in 1969, RFC 1 was published, laying the groundwork for the modern Internet."
 ```
-
-If `--fact` is not provided, a placeholder is used.
 
 ## What the script does
 

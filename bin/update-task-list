@@ -261,6 +261,17 @@ def build_batch_update(
 
         def notes_formatting(base_index, text):
             reqs = []
+            # Clear inherited link formatting from the insertion boundary
+            reqs.append({
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": base_index,
+                        "endIndex": base_index + utf16_len(text),
+                    },
+                    "textStyle": {},
+                    "fields": "link",
+                }
+            })
             offset = 0
             for item, item_type in new_notes_entries:
                 title = item["summary"] if item_type == "event" else item["title"]

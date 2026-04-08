@@ -1,2 +1,3 @@
 # Runtime config files — contain resource IDs, not credentials, but should not be committed
 daily_log.json
+ideas.json

@@ -49,10 +49,11 @@ The GCP project controls which Google APIs the CLI can talk to. Fewer enabled AP
    - People API
    - Google Tasks API
    - Google Keep API
+   - Google Chat API
 
 4. **Do NOT enable other APIs.** Each enabled API is attack surface. If you don't need it, don't turn it on.
 
-**Verify:** Go to **APIs & Services > Enabled APIs** and confirm exactly 9 APIs are listed.
+**Verify:** Go to **APIs & Services > Enabled APIs** and confirm exactly 10 APIs are listed.
 
 ---
 
@@ -64,7 +65,7 @@ The GCP project controls which Google APIs the CLI can talk to. Fewer enabled AP
    - Application type: **Desktop application**
    - Name: something identifiable like `gws-cli-agent`
 
-3. Under **API restrictions**, select **Restrict key** and check only the 9 APIs from Step 2.
+3. Under **API restrictions**, select **Restrict key** and check only the 10 APIs from Step 2.
 
 4. Download the client configuration JSON (or note the **Client ID** and **Client Secret** — you'll need them for auth).
 
@@ -94,7 +95,7 @@ This grants read-only access to Drive, Gmail, Calendar, Docs, Sheets, Slides, an
 ### Option B: Read-Only + Narrow Write Scopes (for agent workflows that need to send email, create events, or create files)
 
 ```bash
-gws auth login --scopes "https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/calendar.readonly,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/documents.readonly,https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/presentations.readonly,https://www.googleapis.com/auth/contacts.readonly,https://www.googleapis.com/auth/tasks.readonly"
+gws auth login --scopes "https://www.googleapis.com/auth/drive.readonly,https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/calendar.readonly,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/documents.readonly,https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/presentations.readonly,https://www.googleapis.com/auth/contacts.readonly,https://www.googleapis.com/auth/tasks.readonly,https://www.googleapis.com/auth/chat.spaces.readonly,https://www.googleapis.com/auth/chat.messages.readonly,https://www.googleapis.com/auth/chat.messages.reactions.create"
 ```
 
 ### After authenticating (either option):
@@ -122,6 +123,9 @@ gws auth login --scopes "https://www.googleapis.com/auth/drive.readonly,https://
 | `presentations.readonly` | Read Google Slides content. No write. |
 | `contacts.readonly` | Read contacts. No write or delete. |
 | `tasks.readonly` | Read task lists and tasks. No write or delete. |
+| `chat.spaces.readonly` | List and read Chat spaces the user is a member of. No create or delete. |
+| `chat.messages.readonly` | Read messages in Chat spaces the user has access to. No send or delete. |
+| `chat.messages.reactions.create` | Add emoji reactions to Chat messages. No read, send, or delete. |
 
 ---
 
@@ -141,7 +145,7 @@ This server-side enforcement means even if someone tampers with the local CLI co
 
 5. Set the app to **Limited**.
 
-6. Allow **only** these 11 scopes (use the full URL format):
+6. Allow **only** these 14 scopes (use the full URL format):
    ```
    https://www.googleapis.com/auth/drive.readonly
    https://www.googleapis.com/auth/drive.file
@@ -154,6 +158,9 @@ This server-side enforcement means even if someone tampers with the local CLI co
    https://www.googleapis.com/auth/presentations.readonly
    https://www.googleapis.com/auth/contacts.readonly
    https://www.googleapis.com/auth/tasks.readonly
+   https://www.googleapis.com/auth/chat.spaces.readonly
+   https://www.googleapis.com/auth/chat.messages.readonly
+   https://www.googleapis.com/auth/chat.messages.reactions.create
    ```
 
 7. Save the configuration.
@@ -201,7 +208,12 @@ Run these checks to confirm everything works as expected.
    gws gmail users messages list --params '{"userId":"me","maxResults":1}'
    ```
 
-4. Confirm a blocked operation actually fails. For example, if you didn't grant `spreadsheets` (full write), try writing to an existing sheet — it should return a permissions error.
+4. Confirm Chat read works:
+   ```bash
+   gws chat spaces list
+   ```
+
+5. Confirm a blocked operation actually fails. For example, if you didn't grant `spreadsheets` (full write), try writing to an existing sheet — it should return a permissions error.
 
 If all reads succeed and unauthorized writes fail, you're set.
 
@@ -222,6 +234,9 @@ If all reads succeed and unauthorized writes fail, you're set.
 | `presentations.readonly` | Read-only | Yes | No | No |
 | `contacts.readonly` | Read-only | Yes | No | No |
 | `tasks.readonly` | Read-only | Yes | No | No |
+| `chat.spaces.readonly` | Read-only | Yes | No | No |
+| `chat.messages.readonly` | Read-only | Yes | No | No |
+| `chat.messages.reactions.create` | Reactions only | No | Yes (reactions) | No |
 
 ---
 

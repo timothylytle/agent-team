@@ -205,7 +205,7 @@ check_service_restriction() {
     done
     deny "helper command '$first_token' is not in the allowlist — add it to allowed_helpers in gws-safe"
   fi
-  local allowed_services="drive gmail calendar docs documents sheets slides people tasks keep"
+  local allowed_services="drive gmail calendar chat docs documents sheets slides people tasks keep"
   for svc in $allowed_services; do
     if [[ "$first_token" == "$svc" ]]; then
       return 0

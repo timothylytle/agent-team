@@ -230,3 +230,35 @@ CREATE TABLE projects (
 CREATE INDEX idx_projects_project_code ON projects(project_code);
 CREATE INDEX idx_projects_company_id ON projects(company_id) WHERE company_id IS NOT NULL;
 CREATE INDEX idx_projects_status_id ON projects(status_id) WHERE status_id IS NOT NULL;
+
+-- ============================================================
+-- Ideas
+-- ============================================================
+
+CREATE TABLE idea_statuses (
+    status_id   INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL
+);
+
+INSERT INTO idea_statuses (status_id, name) VALUES
+    (1, 'New'),
+    (2, 'Analyzed'),
+    (3, 'Promoted'),
+    (4, 'Dismissed');
+
+CREATE TABLE ideas (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    title           TEXT NOT NULL,
+    source_text     TEXT,
+    source_url      TEXT,
+    analysis        TEXT,
+    status_id       INTEGER REFERENCES idea_statuses(status_id) DEFAULT 1,
+    project_id      INTEGER REFERENCES projects(id),
+    company_id      INTEGER REFERENCES companies(id),
+    chat_message_id TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_ideas_status_id ON ideas(status_id) WHERE status_id IS NOT NULL;
+CREATE INDEX idx_ideas_project_id ON ideas(project_id) WHERE project_id IS NOT NULL;

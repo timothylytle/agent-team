@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""chat-safe wrapper for Google Chat API.
+
+Provides a CLI interface with audit logging, command allowlisting,
+and write-gate nonce confirmation for mutating operations.
+
+Usage: chat-safe <resource> <action> [options]
+"""
+
+import json
+import os
+import re
+import secrets
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+
+# --- Paths ---
+
+TOKEN_FILE = os.path.expanduser("~/.config/google-chat/token.json")
+LOG_DIR = os.path.expanduser("~/.local/log/chat-safe")
+LOG_FILE = os.path.join(LOG_DIR, "audit.log")
+NONCE_DIR = os.path.join(LOG_DIR, "nonces")
+
+BASE_URL = "https://chat.googleapis.com/v1"
+
+# --- Validation Patterns ---
+
+SPACE_ID_RE = re.compile(r"^spaces/[A-Za-z0-9_-]+$")
+MESSAGE_NAME_RE = re.compile(r"^spaces/[A-Za-z0-9_-]+/messages/[A-Za-z0-9_.-]+$")
+
+# --- Logging ---
+
+def init_log():
+    os.makedirs(LOG_DIR, 0o700, exist_ok=True)
+    os.makedirs(NONCE_DIR, 0o700, exist_ok=True)
+    # Ensure log file exists with correct permissions
+    fd = os.open(LOG_FILE, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    os.close(fd)
+    # Clean expired nonces (older than 5 minutes)
+    now = time.time()
+    try:
+        for entry in os.scandir(NONCE_DIR):
+            if entry.name.endswith(".json") and (now - entry.stat().st_mtime) > 300:
+                os.unlink(entry.path)
+    except OSError:
+        pass
+
+
+def log_entry(cmd, decision, exit_code=None):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = {
+        "timestamp": ts,
+        "command": cmd,
+        "decision": decision,
+        "exit_code": exit_code,
+    }
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def deny(cmd_str, reason):
+    log_entry(cmd_str, "BLOCKED")
+    print(f"chat-safe: BLOCKED — {reason}", file=sys.stderr)
+    sys.exit(1)
+
+
+def error(msg):
+    print(f"chat-safe: ERROR — {msg}", file=sys.stderr)
+
+
+# --- Credential Loading ---
+
+def load_credentials():
+    if not os.path.isfile(TOKEN_FILE):
+        print(f"chat-safe: FATAL — token file not found: {TOKEN_FILE}", file=sys.stderr)
+        print("Expected JSON with fields: client_id, client_secret, refresh_token, token, token_uri, scopes", file=sys.stderr)
+        sys.exit(1)
+
+    with open(TOKEN_FILE) as f:
+        token_data = json.load(f)
+
+    expiry = None
+    if token_data.get("expiry"):
+        from datetime import datetime
+        expiry = datetime.fromisoformat(token_data["expiry"].rstrip("Z"))
+
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri"),
+        client_id=token_data.get("client_id"),
+        client_secret=token_data.get("client_secret"),
+        scopes=token_data.get("scopes"),
+        expiry=expiry,
+    )
+
+    if not creds.valid or creds.expired or creds.token is None or creds.expiry is None:
+        creds.refresh(Request())
+        # Save refreshed token back with expiry
+        token_data["token"] = creds.token
+        if creds.expiry:
+            token_data["expiry"] = creds.expiry.isoformat() + "Z"
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(token_data, f, indent=2)
+
+    return creds
+
+
+# --- Nonce Functions ---
+
+def generate_nonce():
+    return secrets.token_hex(4)
+
+
+def save_nonce(nonce, cmd):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_epoch = time.time() + 300  # 5 minutes
+    expires = datetime.fromtimestamp(expires_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = {"nonce": nonce, "cmd": cmd, "ts": ts, "expires": expires}
+    path = os.path.join(NONCE_DIR, f"{nonce}.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+
+
+def verify_nonce(cmd_str, nonce, current_cmd):
+    if not re.match(r"^[a-f0-9]+$", nonce):
+        deny(cmd_str, "invalid nonce format")
+
+    nonce_file = os.path.join(NONCE_DIR, f"{nonce}.json")
+
+    if not os.path.isfile(nonce_file):
+        log_entry(cmd_str, "BLOCKED")
+        print("chat-safe: BLOCKED — invalid or expired nonce", file=sys.stderr)
+        sys.exit(1)
+
+    with open(nonce_file) as f:
+        data = json.load(f)
+
+    stored_cmd = data["cmd"]
+    stored_expires = data["expires"]
+
+    # Parse expiry and check
+    expires_dt = datetime.strptime(stored_expires, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    now_dt = datetime.now(timezone.utc)
+    if now_dt > expires_dt:
+        os.unlink(nonce_file)
+        log_entry(cmd_str, "BLOCKED")
+        print("chat-safe: BLOCKED — nonce expired", file=sys.stderr)
+        sys.exit(1)
+
+    if current_cmd != stored_cmd:
+        log_entry(cmd_str, "BLOCKED")
+        print("chat-safe: BLOCKED — command does not match dry-run", file=sys.stderr)
+        sys.exit(1)
+
+    # Valid — delete nonce file (one-time use)
+    os.unlink(nonce_file)
+
+
+# --- API Call ---
+
+def api_call(creds, method, endpoint, body=None):
+    url = f"{BASE_URL}{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.request(method, url, headers=headers, json=body)
+    except requests.RequestException as e:
+        error(f"network failure: {e}")
+        return 1
+
+    if 200 <= resp.status_code < 300:
+        if resp.content:
+            print(json.dumps(resp.json(), indent=2))
+        return 0
+
+    status = resp.status_code
+    if status == 401:
+        error("401 Unauthorized (check your credentials)")
+    elif status == 403:
+        error("403 Forbidden (insufficient permissions)")
+    elif status == 429:
+        retry_after = resp.headers.get("Retry-After", "")
+        error("429 Rate Limited")
+        if retry_after:
+            print(f"Retry-After: {retry_after} seconds", file=sys.stderr)
+    else:
+        error(f"HTTP {status}")
+
+    try:
+        print(resp.text, file=sys.stderr)
+    except Exception:
+        pass
+    return 1
+
+
+# --- Input Validation Helpers ---
+
+def validate_space_id(cmd_str, space_id):
+    if not SPACE_ID_RE.match(space_id):
+        deny(cmd_str, f"invalid space ID format: {space_id}")
+
+
+def validate_message_name(cmd_str, message_name):
+    if not MESSAGE_NAME_RE.match(message_name):
+        deny(cmd_str, f"invalid message name format: {message_name}")
+
+
+# --- Command Handlers ---
+
+def cmd_spaces_list(cmd_str, creds, args):
+    log_entry(cmd_str, "ALLOWED")
+    rc = api_call(creds, "GET", "/spaces")
+    log_entry(cmd_str, "ALLOWED", rc)
+    return rc
+
+
+def cmd_spaces_messages_list(cmd_str, creds, args):
+    if not args:
+        deny(cmd_str, "spaces messages list requires a SPACE_ID")
+
+    space_id = args.pop(0)
+    validate_space_id(cmd_str, space_id)
+
+    params = []
+    while args:
+        opt = args.pop(0)
+        if opt == "--filter":
+            if not args:
+                deny(cmd_str, "--filter requires a value")
+            params.append(f"filter={args.pop(0)}")
+        elif opt == "--page-size":
+            if not args:
+                deny(cmd_str, "--page-size requires a value")
+            params.append(f"pageSize={args.pop(0)}")
+        elif opt == "--page-token":
+            if not args:
+                deny(cmd_str, "--page-token requires a value")
+            params.append(f"pageToken={args.pop(0)}")
+        else:
+            deny(cmd_str, f"unknown option for spaces messages list: {opt}")
+
+    endpoint = f"/{space_id}/messages"
+    if params:
+        endpoint += "?" + "&".join(params)
+
+    log_entry(cmd_str, "ALLOWED")
+    rc = api_call(creds, "GET", endpoint)
+    log_entry(cmd_str, "ALLOWED", rc)
+    return rc
+
+
+def cmd_spaces_messages_get(cmd_str, creds, args):
+    if not args:
+        deny(cmd_str, "spaces messages get requires a MESSAGE_NAME")
+
+    message_name = args.pop(0)
+    validate_message_name(cmd_str, message_name)
+
+    if args:
+        deny(cmd_str, f"unknown option for spaces messages get: {args[0]}")
+
+    log_entry(cmd_str, "ALLOWED")
+    rc = api_call(creds, "GET", f"/{message_name}")
+    log_entry(cmd_str, "ALLOWED", rc)
+    return rc
+
+
+def cmd_spaces_messages_delete(cmd_str, creds, args):
+    if not args:
+        deny(cmd_str, "spaces messages delete requires a MESSAGE_NAME")
+
+    message_name = args.pop(0)
+    validate_message_name(cmd_str, message_name)
+
+    confirmed_nonce = ""
+    while args:
+        opt = args.pop(0)
+        if opt == "--confirmed":
+            if not args:
+                deny(cmd_str, "--confirmed requires a value")
+            confirmed_nonce = args.pop(0)
+        else:
+            deny(cmd_str, f"unknown option for spaces messages delete: {opt}")
+
+    # Build match command without --confirmed
+    match_cmd = f"chat spaces messages delete {message_name}"
+
+    if confirmed_nonce:
+        verify_nonce(cmd_str, confirmed_nonce, match_cmd)
+        log_entry(cmd_str, "CONFIRMED")
+        rc = api_call(creds, "DELETE", f"/{message_name}")
+        log_entry(cmd_str, "CONFIRMED", rc)
+        return rc
+
+    # Dry-run
+    nonce = generate_nonce()
+    save_nonce(nonce, match_cmd)
+    log_entry(cmd_str, "DRY-RUN-ENFORCED")
+
+    dry_run = {
+        "operation": "DELETE message",
+        "message_name": message_name,
+        "method": "DELETE",
+        "url": f"{BASE_URL}/{message_name}",
+        "nonce": nonce,
+        "confirm_command": f"chat-safe spaces messages delete {message_name} --confirmed {nonce}",
+    }
+    print(json.dumps(dry_run, indent=2))
+
+    print("", file=sys.stderr)
+    print("chat-safe: DRY-RUN-ENFORCED — write operation requires confirmation", file=sys.stderr)
+    print(f"To execute, re-run with: chat-safe spaces messages delete {message_name} --confirmed {nonce}", file=sys.stderr)
+    return 2
+
+
+def cmd_spaces_messages_reactions_create(cmd_str, creds, args):
+    if not args:
+        deny(cmd_str, "spaces messages reactions create requires a MESSAGE_NAME")
+
+    message_name = args.pop(0)
+    validate_message_name(cmd_str, message_name)
+
+    emoji = ""
+    confirmed_nonce = ""
+    while args:
+        opt = args.pop(0)
+        if opt == "--emoji":
+            if not args:
+                deny(cmd_str, "--emoji requires a value")
+            emoji = args.pop(0)
+        elif opt == "--confirmed":
+            if not args:
+                deny(cmd_str, "--confirmed requires a value")
+            confirmed_nonce = args.pop(0)
+        else:
+            deny(cmd_str, f"unknown option for spaces messages reactions create: {opt}")
+
+    if not emoji:
+        deny(cmd_str, "spaces messages reactions create requires --emoji")
+
+    # Build match command without --confirmed
+    match_cmd = f"chat spaces messages reactions create {message_name} --emoji {emoji}"
+
+    if confirmed_nonce:
+        verify_nonce(cmd_str, confirmed_nonce, match_cmd)
+        log_entry(cmd_str, "CONFIRMED")
+        body = {"emoji": {"unicode": emoji}}
+        rc = api_call(creds, "POST", f"/{message_name}/reactions", body=body)
+        log_entry(cmd_str, "CONFIRMED", rc)
+        return rc
+
+    # Dry-run
+    nonce = generate_nonce()
+    save_nonce(nonce, match_cmd)
+    log_entry(cmd_str, "DRY-RUN-ENFORCED")
+
+    dry_run = {
+        "operation": "CREATE reaction",
+        "message_name": message_name,
+        "emoji": emoji,
+        "method": "POST",
+        "url": f"{BASE_URL}/{message_name}/reactions",
+        "body": {"emoji": {"unicode": emoji}},
+        "nonce": nonce,
+        "confirm_command": f"chat-safe spaces messages reactions create {message_name} --emoji {emoji} --confirmed {nonce}",
+    }
+    print(json.dumps(dry_run, indent=2))
+
+    print("", file=sys.stderr)
+    print("chat-safe: DRY-RUN-ENFORCED — write operation requires confirmation", file=sys.stderr)
+    print(f"To execute, re-run with: chat-safe spaces messages reactions create {message_name} --emoji {emoji} --confirmed {nonce}", file=sys.stderr)
+    return 2
+
+
+# --- Usage ---
+
+USAGE = """\
+Usage: chat-safe <resource> <action> [options]
+
+Commands:
+  spaces list
+  spaces messages list    SPACE_ID [--filter "..."] [--page-size N] [--page-token TOKEN]
+  spaces messages get     MESSAGE_NAME
+  spaces messages delete  MESSAGE_NAME [--confirmed NONCE]
+  spaces messages reactions create MESSAGE_NAME --emoji EMOJI [--confirmed NONCE]
+
+All other operations are blocked."""
+
+
+# --- Main ---
+
+def main():
+    init_log()
+
+    argv = sys.argv[1:]
+    cmd_str = "chat (no args)" if not argv else f"chat {' '.join(argv)}"
+
+    if not argv:
+        print(USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    # Parse resource path: spaces, spaces messages, spaces messages reactions
+    # Determine the command by consuming tokens from the front
+    resource = argv.pop(0)
+
+    if resource != "spaces":
+        deny(cmd_str, f"command '{resource}' is not in the allowlist")
+
+    if not argv:
+        deny(cmd_str, "incomplete command")
+
+    action = argv.pop(0)
+
+    if action == "list":
+        # spaces list
+        if argv:
+            deny(cmd_str, f"unknown option for spaces list: {argv[0]}")
+        creds = load_credentials()
+        rc = cmd_spaces_list(cmd_str, creds, argv)
+        sys.exit(rc)
+
+    elif action == "messages":
+        if not argv:
+            deny(cmd_str, "incomplete command")
+
+        sub_action = argv.pop(0)
+
+        if sub_action == "list":
+            creds = load_credentials()
+            rc = cmd_spaces_messages_list(cmd_str, creds, argv)
+            sys.exit(rc)
+
+        elif sub_action == "get":
+            creds = load_credentials()
+            rc = cmd_spaces_messages_get(cmd_str, creds, argv)
+            sys.exit(rc)
+
+        elif sub_action == "delete":
+            creds = load_credentials()
+            rc = cmd_spaces_messages_delete(cmd_str, creds, argv)
+            sys.exit(rc)
+
+        elif sub_action == "reactions":
+            if not argv:
+                deny(cmd_str, "incomplete command")
+
+            reactions_action = argv.pop(0)
+
+            if reactions_action == "create":
+                creds = load_credentials()
+                rc = cmd_spaces_messages_reactions_create(cmd_str, creds, argv)
+                sys.exit(rc)
+            else:
+                deny(cmd_str, f"command 'spaces messages reactions {reactions_action}' is not in the allowlist")
+
+        else:
+            deny(cmd_str, f"command 'spaces messages {sub_action}' is not in the allowlist")
+
+    else:
+        deny(cmd_str, f"command 'spaces {action}' is not in the allowlist")
+
+
+if __name__ == "__main__":
+    main()

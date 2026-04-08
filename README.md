@@ -7,6 +7,7 @@ AI agent assistant and PKM
 |-------|-------------|
 | [GWS CLI Setup](docs/guides/gws-cli-setup.md) | Install and configure gws-cli with restricted OAuth scopes for AI agent use |
 | [FreshDesk Setup](docs/guides/freshdesk-setup.md) | Create a FreshDesk collaborator account and configure API access for AI agent use |
+| [Google Chat Ideas Setup](docs/guides/google-chat-ideas-setup.md) | Set up a dedicated Google Chat space for capturing ideas and quick notes |
 
 ## Audit Logs
 

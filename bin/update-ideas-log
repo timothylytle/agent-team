@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Ideas log updater.
+
+Adds an entry to the Thoughts / Ideas section of today's daily log.
+
+Usage:
+    bin/update-ideas-log --title "Idea title" --analysis "Brief analysis" [--source-url "https://..."] [--auto-confirm]
+"""
+
+import argparse
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    execute_batch_update,
+    extract_section_text,
+    fetch_doc,
+    find_last_bullet_end_in_section,
+    get_cache_db,
+    read_configs,
+    update_cache,
+    utf16_len,
+)
+
+
+# --- Step 2: Check cache for section boundaries ---
+
+def get_section_boundaries(doc_id, today_str):
+    """Query the daily-log-cache for today's thoughts_ideas section boundaries.
+    Returns (start_index, end_index) or None if not cached."""
+    db = get_cache_db()
+    entry = db.execute(
+        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
+        (doc_id, today_str),
+    ).fetchone()
+    if not entry:
+        db.close()
+        return None
+    section = db.execute(
+        "SELECT start_index, end_index FROM sections "
+        "WHERE entry_id = ? AND section_type = 'thoughts_ideas'",
+        (entry["id"],),
+    ).fetchone()
+    db.close()
+    if not section:
+        return None
+    return section["start_index"], section["end_index"]
+
+
+# --- Step 5: Build batchUpdate ---
+
+def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
+    """Build the batchUpdate JSON for inserting a new idea line.
+
+    When inherit_bullet is True, inserts at last_bullet_end - 1 (before the
+    existing paragraph's trailing newline). The leading \\n splits the existing
+    paragraph and new paragraphs inherit bullet membership, paragraph style,
+    and font styling automatically.
+
+    When inherit_bullet is False (fallback), inserts at section_end with
+    explicit paragraph style, bullet creation, and font styling.
+    """
+    if inherit_bullet:
+        insert_text = "\n" + line_text
+    else:
+        insert_text = line_text + "\n"
+
+    requests = []
+
+    # 1. Insert text
+    requests.append({
+        "insertText": {
+            "location": {"index": insert_index},
+            "text": insert_text,
+        }
+    })
+
+    if inherit_bullet:
+        # Clear strikethrough that may be inherited from checked checkboxes
+        text_start = insert_index + utf16_len("\n")
+        text_end = insert_index + utf16_len(insert_text)
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": text_start, "endIndex": text_end},
+                "textStyle": {"strikethrough": False},
+                "fields": "strikethrough",
+            }
+        })
+    else:
+        # Fallback: explicit paragraph style, bullets, and font styling
+        text_start = insert_index
+        text_end = insert_index + utf16_len(insert_text)
+
+        # 2. Reset paragraph style to NORMAL_TEXT
+        requests.append({
+            "updateParagraphStyle": {
+                "range": {
+                    "startIndex": text_start,
+                    "endIndex": text_end,
+                },
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType",
+            }
+        })
+
+        # 3. Apply checkbox bullets
+        requests.append({
+            "createParagraphBullets": {
+                "range": {
+                    "startIndex": text_start,
+                    "endIndex": text_end,
+                },
+                "bulletPreset": style["bulletPresets"]["checkbox"],
+            }
+        })
+
+        # 4. Apply font styling
+        text_style = {
+            "weightedFontFamily": {
+                "fontFamily": style["fonts"]["body"],
+            }
+        }
+        fields = "weightedFontFamily"
+
+        if style["colors"].get("bodyText"):
+            text_style["foregroundColor"] = {
+                "color": {"rgbColor": style["colors"]["bodyText"]}
+            }
+            fields += ",foregroundColor"
+
+        requests.append({
+            "updateTextStyle": {
+                "range": {
+                    "startIndex": text_start,
+                    "endIndex": text_end,
+                },
+                "textStyle": text_style,
+                "fields": fields,
+            }
+        })
+
+    return {"requests": requests}
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(description="Add an entry to the Thoughts / Ideas section of the daily log")
+    parser.add_argument("--title", required=True, help="Idea title")
+    parser.add_argument("--analysis", required=True, help="Brief analysis text")
+    parser.add_argument("--source-url", help="Optional source URL")
+    parser.add_argument("--auto-confirm", action="store_true", help="Automatically confirm the batchUpdate write")
+    args = parser.parse_args()
+    auto_confirm = args.auto_confirm
+
+    # Build the line text
+    line_text = f"{args.title} \u2014 {args.analysis}"
+    if args.source_url:
+        line_text += f" \u2014 {args.source_url}"
+
+    # Step 1: Read configs
+    config, style = read_configs()
+    doc_id = config["documentId"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_heading = datetime.now().strftime("%A %b %-d, %Y")
+
+    print(f"Adding idea to Thoughts / Ideas for {today_heading}")
+    print(f"Document ID: {doc_id}")
+
+    # Step 2: Check cache for section boundaries
+    boundaries = get_section_boundaries(doc_id, today_str)
+    if not boundaries:
+        print("ERROR: No cached entry for today. Run /daily-log first to create the entry.", file=sys.stderr)
+        sys.exit(1)
+
+    section_start, section_end = boundaries
+    print(f"Thoughts / Ideas section: index {section_start} to {section_end}")
+
+    # Step 3: Fetch doc and extract current section text
+    doc = fetch_doc(doc_id)
+    section_text = extract_section_text(doc, section_start, section_end)
+    print(f"Current section text: {repr(section_text[:100])}...")
+
+    # Step 4: Build and execute batchUpdate
+    last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
+    if last_bullet:
+        insert_index = last_bullet - 1  # before the trailing \n
+        inherit_bullet = True
+    else:
+        insert_index = section_end  # fallback: no existing bullets
+        inherit_bullet = False
+
+    print(f"Insert index: {insert_index} (inherit_bullet={inherit_bullet})")
+    print(f"Line: {line_text}")
+
+    batch = build_batch_update(line_text, insert_index, style, inherit_bullet)
+    success = execute_batch_update(doc_id, batch, auto_confirm)
+
+    if not success:
+        sys.exit(2)
+
+    # Step 5: Update cache
+    update_cache(doc_id)
+
+    print(f"\nDone. Added idea to Thoughts / Ideas section:")
+    print(f"  {line_text}")
+
+
+if __name__ == "__main__":
+    main()

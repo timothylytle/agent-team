@@ -343,15 +343,26 @@ def scan_ticket_notes(ticket_id, pattern):
         "conversations": [],
     }
 
-    stdout, _, _ = run_cmd(
-        [FRESHDESK_SAFE, "tickets", "view", str(ticket_id), "--include", "conversations"]
-    )
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        return result
+    # Fetch all conversations using paginated endpoint
+    conversations = []
+    page = 1
+    per_page = 100
+    while True:
+        stdout, _, _ = run_cmd(
+            [FRESHDESK_SAFE, "tickets", "conversations", str(ticket_id),
+             "--page", str(page), "--per_page", str(per_page)]
+        )
+        try:
+            page_data = json.loads(stdout)
+        except json.JSONDecodeError:
+            break
+        if not isinstance(page_data, list):
+            break
+        conversations.extend(page_data)
+        if len(page_data) < per_page:
+            break
+        page += 1
 
-    conversations = data.get("conversations", [])
     result["conversations"] = conversations
 
     for conv in conversations:

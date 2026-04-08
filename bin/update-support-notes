@@ -719,7 +719,7 @@ def _build_note_injection_requests(section_text, heading_text, section_lines,
 
 def parse_doc_id_from_url(body):
     """Extract Google Doc ID from a note body containing a docs.google.com URL."""
-    match = re.search(r"docs\.google\.com/document/d/([^/\s]+)", body)
+    match = re.search(r"docs\.google\.com/document/d/([^/\s\"'<>]+)", body)
     if match:
         return match.group(1)
     return None
@@ -1175,15 +1175,25 @@ def _inject_all_tagged_notes(tickets_with_docs, conversations_cache, style, auto
         if tid in conversations_cache:
             conversations = conversations_cache[tid]
         else:
-            # Fetch conversations
-            stdout, _, _ = run_cmd(
-                [FRESHDESK_SAFE, "tickets", "view", str(tid), "--include", "conversations"]
-            )
-            try:
-                data = json.loads(stdout)
-                conversations = data.get("conversations", [])
-            except json.JSONDecodeError:
-                conversations = []
+            # Fetch all conversations using paginated endpoint
+            conversations = []
+            page = 1
+            per_page = 100
+            while True:
+                stdout, _, _ = run_cmd(
+                    [FRESHDESK_SAFE, "tickets", "conversations", str(tid),
+                     "--page", str(page), "--per_page", str(per_page)]
+                )
+                try:
+                    page_data = json.loads(stdout)
+                except json.JSONDecodeError:
+                    break
+                if not isinstance(page_data, list):
+                    break
+                conversations.extend(page_data)
+                if len(page_data) < per_page:
+                    break
+                page += 1
             conversations_cache[tid] = conversations
 
         result = inject_tagged_notes(tid, doc_id, conversations, style, auto_confirm)

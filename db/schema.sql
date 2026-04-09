@@ -101,6 +101,9 @@ CREATE TABLE tickets (
     resolved_at     TEXT,                   -- ISO 8601, from FreshDesk stats
     closed_at       TEXT,                   -- ISO 8601, from FreshDesk stats
     resolution_summary TEXT,                -- LLM-generated 2-3 sentence summary
+    support_doc_id      TEXT,                   -- Google Drive file ID of support note doc
+    support_doc_url     TEXT,                   -- Web view URL of support note doc
+    freshdesk_note_id   INTEGER,               -- FreshDesk conversation ID of the private note
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );

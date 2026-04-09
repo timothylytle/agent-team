@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Ideas log updater.
+"""Publish a note to today's daily log.
 
-Adds an entry to the Thoughts / Ideas section of today's daily log.
+Adds a timestamped checkbox entry to the Notes section of today's daily log.
 
 Usage:
-    bin/update-ideas-log --title "Idea title" --analysis "Brief analysis" [--source-url "https://..."] [--auto-confirm]
+    bin/publish-to-notes --text "Note text" [--auto-confirm]
 """
 
 import argparse
@@ -17,11 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.daily_log_utils import (
     execute_batch_update,
-    extract_section_text,
     fetch_doc,
     find_last_bullet_end_in_section,
     get_cache_db,
-    publish_note,
     read_configs,
     update_cache,
     utf16_len,
@@ -31,7 +29,7 @@ from lib.daily_log_utils import (
 # --- Step 2: Check cache for section boundaries ---
 
 def get_section_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's thoughts_ideas section boundaries.
+    """Query the daily-log-cache for today's notes section boundaries.
     Returns (start_index, end_index) or None if not cached."""
     db = get_cache_db()
     entry = db.execute(
@@ -43,7 +41,7 @@ def get_section_boundaries(doc_id, today_str):
         return None
     section = db.execute(
         "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'thoughts_ideas'",
+        "WHERE entry_id = ? AND section_type = 'notes'",
         (entry["id"],),
     ).fetchone()
     db.close()
@@ -55,7 +53,7 @@ def get_section_boundaries(doc_id, today_str):
 # --- Step 5: Build batchUpdate ---
 
 def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
-    """Build the batchUpdate JSON for inserting a new idea line.
+    """Build the batchUpdate JSON for inserting a new note line.
 
     When inherit_bullet is True, inserts at last_bullet_end - 1 (before the
     existing paragraph's trailing newline). The leading \\n splits the existing
@@ -150,18 +148,15 @@ def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
 # --- Main ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Add an entry to the Thoughts / Ideas section of the daily log")
-    parser.add_argument("--title", required=True, help="Idea title")
-    parser.add_argument("--analysis", required=True, help="Brief analysis text")
-    parser.add_argument("--source-url", help="Optional source URL")
+    parser = argparse.ArgumentParser(description="Add a timestamped note to the Notes section of the daily log")
+    parser.add_argument("--text", required=True, help="Note text")
     parser.add_argument("--auto-confirm", action="store_true", help="Automatically confirm the batchUpdate write")
     args = parser.parse_args()
     auto_confirm = args.auto_confirm
 
     # Build the line text
-    line_text = f"{args.title} \u2014 {args.analysis}"
-    if args.source_url:
-        line_text += f" \u2014 {args.source_url}"
+    timestamp = datetime.now().strftime("%-I:%M %p")
+    line_text = f"{timestamp} \u2014 {args.text}"
 
     # Step 1: Read configs
     config, style = read_configs()
@@ -169,7 +164,7 @@ def main():
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_heading = datetime.now().strftime("%A %b %-d, %Y")
 
-    print(f"Adding idea to Thoughts / Ideas for {today_heading}")
+    print(f"Adding note to Notes for {today_heading}")
     print(f"Document ID: {doc_id}")
 
     # Step 2: Check cache for section boundaries
@@ -179,12 +174,10 @@ def main():
         sys.exit(1)
 
     section_start, section_end = boundaries
-    print(f"Thoughts / Ideas section: index {section_start} to {section_end}")
+    print(f"Notes section: index {section_start} to {section_end}")
 
-    # Step 3: Fetch doc and extract current section text
+    # Step 3: Fetch doc
     doc = fetch_doc(doc_id)
-    section_text = extract_section_text(doc, section_start, section_end)
-    print(f"Current section text: {repr(section_text[:100])}...")
 
     # Step 4: Build and execute batchUpdate
     last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
@@ -207,9 +200,7 @@ def main():
     # Step 5: Update cache
     update_cache(doc_id)
 
-    publish_note(f"Idea added: {args.title}", auto_confirm)
-
-    print(f"\nDone. Added idea to Thoughts / Ideas section:")
+    print(f"\nDone. Added note to Notes section:")
     print(f"  {line_text}")
 
 

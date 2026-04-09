@@ -27,6 +27,7 @@ from lib.daily_log_utils import (
     FRESHDESK_TICKET_URL,
     GWS_SAFE,
     CRM_SAFE,
+    publish_note,
     run_cmd,
     utf16_len,
 )
@@ -1147,6 +1148,16 @@ def main():
 
     if skipped_tickets:
         _report_skipped(skipped_tickets)
+
+    # Publish note if something changed
+    total_injected = sum(r.get("injected_count", 0) for r in injection_results.values())
+    if created_docs or total_injected:
+        parts = []
+        if created_docs:
+            parts.append(f"{len(created_docs)} doc(s) created")
+        if total_injected:
+            parts.append(f"{total_injected} note(s) injected")
+        publish_note(f"Support notes updated: {', '.join(parts)}.", auto_confirm)
 
     # Exit with error if anything failed
     if failed_docs:

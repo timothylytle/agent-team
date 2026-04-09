@@ -7,7 +7,7 @@ You are executing the Task List sub-skill. This skill delegates to a determinist
 
 ## Purpose
 
-Fetch current calendar events, in-progress tasks, and waiting tasks, then update the Task List section and Notes section of today's daily log entry.
+Fetch current calendar events, in-progress tasks, and waiting tasks, then update the Task List section of today's daily log entry.
 
 ## Execution
 
@@ -23,16 +23,17 @@ If it exits with a non-zero code, report the error output.
 ## What the Script Does
 
 1. Reads config files (`daily_log.json`, `doc_styles.json`)
-2. Checks the daily-log-cache for today's Task List and Notes section boundaries
+2. Checks the daily-log-cache for today's Task List section boundaries
 3. Fetches calendar events for today (with 5-minute local cache)
 4. Fetches in-progress and waiting tasks (with 5-minute local cache)
 5. Filters events (excludes `workingLocation` type and excluded colorIds) and waiting tasks (only today's due date)
-6. Fetches the Google Doc and extracts current Task List and Notes section content
-7. Parses existing priority items, waiting/blockers, and Notes HEADING_3 titles
-8. Computes diffs: new priorities, updated waiting/blockers, new Notes headings
+6. Fetches the Google Doc and extracts current Task List section content
+7. Parses existing priority items and waiting/blockers
+8. Computes diffs: new priorities, updated waiting/blockers
 9. Sorts new entries: all-day events first (alphabetically), timed events (by start time), tasks (list order)
-10. Builds and executes a batchUpdate with formatting (bullets, fonts, heading styles, link lines)
+10. Builds and executes a batchUpdate with formatting (bullets, fonts, link lines)
 11. Updates the daily-log-cache after a successful write
+12. Publishes a summary note to the Notes section via publish-to-notes
 
 ## Prerequisites
 

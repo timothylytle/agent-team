@@ -26,6 +26,7 @@ from lib.daily_log_utils import (
     fetch_open_tickets,
     fetch_tasks,
     format_event_time,
+    publish_note,
     read_configs,
     sort_entries,
     update_cache,
@@ -167,23 +168,6 @@ def build_entry_text(today_heading, events, in_progress_tasks, waiting_tasks, ti
     # Notes heading
     add_line("Notes:", "HEADING_2")
 
-    # Notes sub-sections: same ordering as priorities
-    for item, item_type in sorted_items:
-        if item_type == "event":
-            title = item["summary"]
-            link_url = item.get("support_doc_url") or item.get("html_link", "")
-            link_label = "event"
-        else:
-            title = item["title"]
-            link_url = item.get("web_view_link", "")
-            link_label = "task"
-
-        if link_url:
-            heading_text = f"{title} [{link_label}]"
-            add_line(heading_text, "HEADING_3", inline_link=True, link_url=link_url, link_label=f"[{link_label}]")
-        else:
-            add_line(title, "HEADING_3")
-
     # Build the full text block (each line gets a trailing newline)
     full_text = "\n".join(lines) + "\n"
 
@@ -229,7 +213,6 @@ def build_batch_update(full_text, meta, style):
     normal_ranges = []   # (start, end) for all NORMAL_TEXT
     default_bullet_ranges = []  # (start, end) for default bullet items
     checkbox_bullet_ranges = []  # (start, end) for checkbox bullet items
-    inline_links = []  # (link_start, link_end, url) for inline [event]/[task] links
 
     cursor = 1  # start after the insertion point
     for i, m in enumerate(meta):
@@ -259,15 +242,6 @@ def build_batch_update(full_text, meta, style):
             default_bullet_ranges.append((line_start, line_end))
         elif bullet_type == "checkbox":
             checkbox_bullet_ranges.append((line_start, line_end))
-
-        # Track inline links within headings (e.g., "[event]" or "[task]")
-        if m.get("inline_link"):
-            link_label = m["link_label"]
-            link_url = m["link_url"]
-            # The link label is at the end of the line text
-            label_start = line_start + utf16_len(line_text) - utf16_len(link_label)
-            label_end = line_start + utf16_len(line_text)
-            inline_links.append((label_start, label_end, link_url))
 
         cursor = line_end
 
@@ -329,16 +303,6 @@ def build_batch_update(full_text, meta, style):
                 "range": {"startIndex": start, "endIndex": end},
                 "textStyle": body_text_style,
                 "fields": body_fields,
-            }
-        })
-
-    # 7. Inline link styling on Notes HEADING_3 [event]/[task] labels
-    for link_start, link_end, link_url in inline_links:
-        requests.append({
-            "updateTextStyle": {
-                "range": {"startIndex": link_start, "endIndex": link_end},
-                "textStyle": {"link": {"url": link_url}},
-                "fields": "link",
             }
         })
 
@@ -449,14 +413,20 @@ def main():
     run_update_path(auto_confirm)
 
     # Report summary
-    sorted_items = sort_entries(events, in_progress_tasks)
     print(f"\nDaily log entry created for {today_heading}:")
     print(f"  {len(events)} calendar event(s)")
     print(f"  {len(in_progress_tasks)} in-progress task(s)")
     print(f"  {len(waiting_tasks)} waiting task(s)")
     print(f"  {len(tickets)} open ticket(s)")
-    print(f"  {len(sorted_items)} Notes sub-section(s)")
     print(f"  Fact: {fact_text}")
+
+    summary_msg = (
+        f"Daily log created. {len(events)} event(s), "
+        f"{len(in_progress_tasks)} task(s), "
+        f"{len(waiting_tasks)} waiting, "
+        f"{len(tickets)} ticket(s)."
+    )
+    publish_note(summary_msg, auto_confirm)
 
     # Step 10: Archive old entries
     if not skip_archive:

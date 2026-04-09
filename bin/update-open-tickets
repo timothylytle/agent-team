@@ -25,6 +25,7 @@ from lib.daily_log_utils import (
     fetch_open_tickets,
     find_last_bullet_end_in_section,
     get_cache_db,
+    publish_note,
     read_configs,
     update_cache,
     utf16_len,
@@ -245,6 +246,8 @@ def main():
 
     # Step 7: Update cache
     update_cache(doc_id)
+
+    publish_note(f"Open tickets updated: added {len(new_tickets)} new ticket(s).", auto_confirm)
 
     print(f"\nDone. Added {len(new_tickets)} new ticket(s) to Open Tickets section.")
     for t in new_tickets:

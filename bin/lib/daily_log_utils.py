@@ -937,3 +937,13 @@ def format_event_time(event):
         return dt.strftime("%-I:%M %p")
     except (ValueError, TypeError):
         return ""
+
+
+def publish_note(text, auto_confirm=False):
+    """Publish a timestamped note to the Notes section of today's daily log."""
+    cmd = [str(REPO_ROOT / "bin" / "publish-to-notes"), "--text", text]
+    if auto_confirm:
+        cmd.append("--auto-confirm")
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.returncode not in (0, 2):
+        print(f"WARNING: publish-to-notes failed: {result.stderr.strip()}", file=sys.stderr)

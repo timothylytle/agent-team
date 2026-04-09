@@ -20,9 +20,10 @@ bin/update-support-calendar --auto-confirm
 
 ### What It Does
 
-1. Fetches calendar events for the next 7 days filtered to support color IDs (`4` = Flamingo/Support, `11` = Tomato/After hours)
-2. Fetches active FreshDesk tickets (non-closed, agent-assigned)
-3. For each support-colored event:
+1. Runs `update-support-notes` to ensure support doc links and private notes exist for all active tickets
+2. Fetches calendar events for the next 7 days filtered to support color IDs (`4` = Flamingo/Support, `11` = Tomato/After hours)
+3. Fetches active FreshDesk tickets (non-closed, agent-assigned)
+4. For each support-colored event:
    - Extracts attendee emails (excluding self)
    - Resolves each attendee to a CRM company/contact
    - Matches the event to the most relevant FreshDesk ticket for that company (prefers Open > Scheduled > most recent)
@@ -31,10 +32,10 @@ bin/update-support-calendar --auto-confirm
    - Creates a CRM meeting record (idempotent — skips if google_event_id already exists)
    - Updates FreshDesk ticket note with calendar event link (appends to existing "Support notes:" note, or creates new note)
    - Updates calendar event summary (if still default pattern) and description (prepends FreshDesk/Support Doc links if not already present)
-4. Prints a summary report
+5. Prints a summary report
 
 ### Prerequisites
 
-- `bin/update-support-notes` should be run first so that Support Doc links exist in FreshDesk ticket notes for the script to pick up.
+- `bin/update-support-notes` is automatically run at the start to ensure support docs and private notes exist before processing.
 
 Report the script output to the user.

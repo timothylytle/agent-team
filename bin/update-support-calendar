@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -249,7 +250,7 @@ def build_event_summary(event, company_name, freshdesk_ticket_id, ticket_subject
 
 
 def process_event(event, active_tickets, contacts_cache, companies_cache,
-                  fd_contact_cache, auto_confirm, dry_run):
+                  fd_contact_cache, crm_ticket_lookup, auto_confirm, dry_run):
     """Process a single support calendar event.
 
     Returns a result dict describing what was done, or None on error.
@@ -453,15 +454,22 @@ def process_event(event, active_tickets, contacts_cache, companies_cache,
             return result
 
     # Step 6: Update FreshDesk ticket notes
+    # 6a: Get support doc URL from CRM first, fallback to FreshDesk scan
+    crm_ticket = crm_ticket_lookup.get(fd_ticket_id)
+    support_doc_url = None
+    if crm_ticket and crm_ticket.get("support_doc_url"):
+        support_doc_url = crm_ticket["support_doc_url"]
+        print(f"    Support doc URL (from CRM): {support_doc_url}")
+
+    # 6b: Scan FreshDesk for existing support-notes note (still needed for note update logic)
     print(f"    Scanning ticket #{fd_ticket_id} for existing support-notes note...")
     scan_result = scan_ticket_notes(fd_ticket_id, "Support notes:")
 
     event_date_str = format_event_date(event)
     event_link = html_link
 
-    # Extract support doc URL from existing note if present
-    support_doc_url = None
-    if scan_result["found"] and scan_result["note_body"]:
+    # 6c: If CRM didn't have doc URL, try extracting from FreshDesk note
+    if not support_doc_url and scan_result["found"] and scan_result["note_body"]:
         doc_match = re.search(
             r"https://docs\.google\.com/document/d/[^\s<\"]+",
             scan_result["note_body"],
@@ -618,6 +626,16 @@ def main():
     if dry_run:
         auto_confirm = False
 
+    # Step 0: Ensure support notes exist for all active tickets
+    print("--- Running support-notes to ensure docs exist ---")
+    support_notes_cmd = [str(Path(__file__).resolve().parent / "update-support-notes")]
+    if auto_confirm:
+        support_notes_cmd.append("--auto-confirm")
+    result = subprocess.run(support_notes_cmd, text=True)
+    if result.returncode not in (0, 2):
+        print(f"WARNING: update-support-notes exited with code {result.returncode}", file=sys.stderr)
+    print()
+
     # Step 1: Fetch support-colored calendar events
     events = fetch_support_events()
     if not events:
@@ -642,6 +660,14 @@ def main():
     except json.JSONDecodeError:
         companies_cache = []
 
+    # Pre-fetch CRM tickets for support doc lookup
+    stdout, _, _ = run_cmd([CRM_SAFE, "tickets", "list"])
+    try:
+        crm_tickets_cache = json.loads(stdout)
+    except json.JSONDecodeError:
+        crm_tickets_cache = []
+    crm_ticket_lookup = {t["freshdesk_id"]: t for t in crm_tickets_cache if t.get("freshdesk_id")}
+
     # Cache for FreshDesk contact lookups (requester_id -> contact dict)
     fd_contact_cache = {}
 
@@ -653,7 +679,7 @@ def main():
 
         result = process_event(
             event, active_tickets, contacts_cache, companies_cache,
-            fd_contact_cache, auto_confirm, dry_run,
+            fd_contact_cache, crm_ticket_lookup, auto_confirm, dry_run,
         )
         results.append(result)
 

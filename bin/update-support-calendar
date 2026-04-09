@@ -26,6 +26,7 @@ from lib.daily_log_utils import (
     CRM_SAFE,
     FRESHDESK_TICKET_URL,
     GWS_SAFE,
+    publish_note,
     run_cmd,
 )
 from lib.support_utils import (
@@ -658,6 +659,13 @@ def main():
 
     # Step 8: Report
     print_report(results)
+
+    matched = [r for r in results if r["matched"]]
+    if matched:
+        publish_note(
+            f"Support calendar processed: {len(matched)} event(s) matched to tickets.",
+            auto_confirm,
+        )
 
 
 if __name__ == "__main__":

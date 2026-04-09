@@ -27,6 +27,7 @@ from lib.daily_log_utils import (
     extract_section_text,
     find_last_bullet_end_in_section,
     get_cache_db,
+    publish_note,
     read_configs,
     run_cmd,
     update_cache,
@@ -392,27 +393,16 @@ def save_email_to_crm(record):
 # --- Deduplication ---
 
 
-def parse_existing_entries(section_text):
-    """Extract existing email entries from section text for dedup.
-    Returns set of (sender_name, subject) tuples."""
-    entries = set()
+def parse_existing_timestamps(section_text):
+    """Extract existing timestamp prefixes from summary entries for dedup.
+    Returns set of timestamp strings like '9:15 AM'."""
+    timestamps = set()
     for line in section_text.strip().split("\n"):
         line = line.strip()
-        if not line:
-            continue
-        # Lines look like: [Sender Name] Subject Line
-        # or: [Company - Sender Name] Subject Line
-        # or: either format with (Add to CRM?) suffix
-        match = re.match(r"\[([^\]]+)\]\s+(.+?)(?:\s+\(Add to CRM\?\))?\s*$", line)
-        if match:
-            bracket_content = match.group(1)
-            # Extract sender name: strip company prefix if present
-            if " - " in bracket_content:
-                sender_name = bracket_content.split(" - ", 1)[1]
-            else:
-                sender_name = bracket_content
-            entries.add((sender_name, match.group(2)))
-    return entries
+        m = re.match(r"^(\d{1,2}:\d{2}\s+[AP]M)\s+\u2014", line)
+        if m:
+            timestamps.add(m.group(1))
+    return timestamps
 
 
 # --- Build batchUpdate ---
@@ -421,26 +411,21 @@ def parse_existing_entries(section_text):
 from lib.daily_log_utils import fetch_doc  # noqa: E402
 
 
-def build_batch_update(email_lines, insert_index, style, inherit_bullet=False):
-    """Build the batchUpdate JSON for inserting email lines.
-
-    Each line: [Sender Name] Subject
-    email_lines is a list of (line_text, gmail_url) tuples.
+def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
+    """Build the batchUpdate JSON for inserting an email summary line.
 
     When inherit_bullet is True, inserts at last_bullet_end - 1 (before the
-    existing paragraph's trailing newline). New paragraphs inherit bullet
-    membership, paragraph style, and font styling automatically. Only Gmail
-    link styling is applied explicitly.
+    existing paragraph's trailing newline). The leading \\n splits the existing
+    paragraph and new paragraphs inherit bullet membership, paragraph style,
+    and font styling automatically.
 
     When inherit_bullet is False (fallback), inserts at section_end with
-    explicit paragraph style, bullet creation, font styling, and links.
+    explicit paragraph style, bullet creation, and font styling.
     """
-    line_texts = [line for line, _ in email_lines]
-
     if inherit_bullet:
-        insert_text = "\n" + "\n".join(line_texts)
+        insert_text = "\n" + line_text
     else:
-        insert_text = "\n".join(line_texts) + "\n"
+        insert_text = line_text + "\n"
 
     requests = []
 
@@ -515,28 +500,6 @@ def build_batch_update(email_lines, insert_index, style, inherit_bullet=False):
                 "fields": fields,
             }
         })
-
-    # Apply Gmail links to each line
-    # In inheritance mode, the leading \n occupies the first position, so
-    # the first line of text starts at insert_index + utf16_len("\n").
-    # In fallback mode, the first line starts at insert_index.
-    if inherit_bullet:
-        cursor = insert_index + utf16_len("\n")
-    else:
-        cursor = insert_index
-
-    for line_text, gmail_url in email_lines:
-        line_start = cursor
-        line_end = cursor + utf16_len(line_text)
-        requests.append({
-            "updateTextStyle": {
-                "range": {"startIndex": line_start, "endIndex": line_end},
-                "textStyle": {"link": {"url": gmail_url}},
-                "fields": "link",
-            }
-        })
-        # Advance past line text + newline
-        cursor = line_end + utf16_len("\n")
 
     return {"requests": requests}
 
@@ -648,67 +611,107 @@ def main():
             msg_id, sender_email, company_id, contact_id, received_at,
         ))
 
-    # Step 8: Fetch doc and check for existing entries
-    doc = fetch_doc(doc_id)
-    section_text = extract_section_text(doc, section_start, section_end)
-    existing_entries = parse_existing_entries(section_text)
-    print(f"Found {len(existing_entries)} existing email entries in doc")
-
-    # Step 9: Build ordered list of new email lines, deduplicating
-    email_lines = []  # list of (line_text, gmail_url)
-    new_email_records = []  # CRM records for new emails
+    # Step 8: Build CRM records for ALL filtered emails
+    crm_records = []
     for category in ("vip", "customer", "internal", "unknown"):
         for (sender_name, subject, line, gmail_url,
              msg_id, sender_email, company_id, contact_id, received_at) in classified[category]:
-            if (sender_name, subject) not in existing_entries:
-                email_lines.append((line, gmail_url))
-                record = {
-                    "gmail_message_id": msg_id,
-                    "sender_email": sender_email,
-                    "sender_name": sender_name,
-                    "subject": subject,
-                    "gmail_url": gmail_url,
-                }
-                if received_at:
-                    record["received_at"] = received_at
-                if contact_id is not None:
-                    record["contact_id"] = contact_id
-                if company_id is not None:
-                    record["company_id"] = company_id
-                new_email_records.append(record)
+            record = {
+                "gmail_message_id": msg_id,
+                "sender_email": sender_email,
+                "sender_name": sender_name,
+                "subject": subject,
+                "gmail_url": gmail_url,
+            }
+            if received_at:
+                record["received_at"] = received_at
+            if contact_id is not None:
+                record["contact_id"] = contact_id
+            if company_id is not None:
+                record["company_id"] = company_id
+            crm_records.append(record)
 
-    if not email_lines:
-        print("Email section is already up to date.")
+    # Step 9: Build summary line
+    vip_count = len(classified["vip"])
+    customer_count = len(classified["customer"])
+    internal_count = len(classified["internal"])
+    unknown_count = len(classified["unknown"])
+    total_count = vip_count + customer_count + internal_count + unknown_count
+
+    # Category breakdown (non-zero only)
+    breakdown_parts = []
+    if vip_count:
+        breakdown_parts.append(f"{vip_count} VIP")
+    if customer_count:
+        breakdown_parts.append(f"{customer_count} customer")
+    if internal_count:
+        breakdown_parts.append(f"{internal_count} internal")
+    if unknown_count:
+        breakdown_parts.append(f"{unknown_count} unknown")
+    category_breakdown = ", ".join(breakdown_parts)
+
+    # Pick top 3-5 suggested subjects (VIP first, then customer)
+    suggested = []
+    for cat in ("vip", "customer"):
+        for (sender_name, subject, line, gmail_url,
+             msg_id, sender_email, company_id, contact_id, received_at) in classified[cat]:
+            company_name = None
+            for c in companies:
+                if company_id and c["id"] == company_id:
+                    company_name = c["name"]
+                    break
+            subj = subject if len(subject) <= 50 else subject[:50] + "..."
+            if company_name:
+                suggested.append(f"[{company_name}] {subj}")
+            else:
+                suggested.append(subj)
+            if len(suggested) >= 5:
+                break
+        if len(suggested) >= 5:
+            break
+
+    timestamp = datetime.now().strftime("%-I:%M %p")
+    summary_line = f"{timestamp} \u2014 {total_count} emails ({category_breakdown})"
+    if suggested:
+        summary_line += f". Suggested: {', '.join(suggested)}"
+
+    print(f"Summary: {summary_line}")
+
+    # Step 10: Check timestamp dedup
+    doc = fetch_doc(doc_id)
+    section_text = extract_section_text(doc, section_start, section_end)
+    existing_timestamps = parse_existing_timestamps(section_text)
+
+    if timestamp in existing_timestamps:
+        print("Already have a summary for this minute")
         sys.exit(0)
 
-    print(f"New emails to add: {len(email_lines)}")
-    for line, _ in email_lines:
-        print(f"  {line}")
-
-    # Step 10: Build and execute batchUpdate
-    # Strategy B: inherit bullet list membership from existing bullets
+    # Step 11: Insert the summary line
     last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
     if last_bullet:
-        insert_index = last_bullet - 1  # before the trailing \n
+        insert_index = last_bullet - 1
         inherit_bullet = True
     else:
-        insert_index = section_end  # fallback: no existing bullets
+        insert_index = section_end
         inherit_bullet = False
-    batch = build_batch_update(email_lines, insert_index, style, inherit_bullet)
+
+    batch = build_batch_update(summary_line, insert_index, style, inherit_bullet)
     success = execute_batch_update(doc_id, batch, auto_confirm)
 
     if not success:
         sys.exit(2)
 
-    # Step 11: Save email records to CRM
-    print(f"Saving {len(new_email_records)} email record(s) to CRM...")
-    for record in new_email_records:
+    # Step 12: Save CRM records
+    print(f"Saving {len(crm_records)} email record(s) to CRM...")
+    for record in crm_records:
         save_email_to_crm(record)
 
-    # Step 12: Update cache
+    # Step 13: Update cache
     update_cache(doc_id)
 
-    print(f"\nDone. Added {len(email_lines)} email(s) to Email section.")
+    publish_note(f"Email summary added: {total_count} emails ({category_breakdown}).", auto_confirm)
+
+    print("\nDone. Added email summary to Email section.")
 
 
 if __name__ == "__main__":

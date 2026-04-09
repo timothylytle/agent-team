@@ -65,7 +65,8 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | Support Calendar | Matches calendar events to FreshDesk tickets, creates CRM meeting records, updates ticket notes and calendar event details | `.claude/skills/support-calendar/SKILL.md` |
 | Ticket Resolution | Updates support docs and CRM records when a FreshDesk ticket is resolved or closed | `.claude/skills/ticket-resolution/SKILL.md` |
 | Task List | Updates Task List section of daily log with calendar events, tasks, and waiting/blockers | `.claude/skills/task-list/SKILL.md` |
-| Email | Updates Email section of daily log with filtered, prioritized inbox emails | `.claude/skills/email/SKILL.md` |
+| Email | Updates Email section of daily log with timestamped summary of inbox emails | `.claude/skills/email/SKILL.md` |
+| Publish to Notes | Publishes a timestamped message to the Notes section of today's daily log | `.claude/skills/publish-to-notes/SKILL.md` |
 | Project | Development Project Manager — creates, researches, and tracks development projects | `.claude/skills/project/SKILL.md` |
 
 ## Hiring Process

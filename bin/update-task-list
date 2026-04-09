@@ -2,9 +2,8 @@
 """Deterministic Task List updater.
 
 Fetches current calendar events, in-progress tasks, and waiting tasks,
-then updates the Task List section and Notes section of today's daily
-log entry. Replaces the LLM-orchestrated task-list skill with a direct
-Python implementation.
+then updates the Task List section of today's daily log entry. Replaces
+the LLM-orchestrated task-list skill with a direct Python implementation.
 
 Usage:
     bin/update-task-list [--auto-confirm]
@@ -28,6 +27,7 @@ from lib.daily_log_utils import (
     find_last_bullet_end_in_section,
     format_event_time,
     get_cache_db,
+    publish_note,
     read_configs,
     sort_entries,
     update_cache,
@@ -39,8 +39,8 @@ from lib.daily_log_utils import (
 
 
 def get_section_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's task_list and notes section boundaries.
-    Returns dict with 'task_list' and 'notes' keys, each (start_index, end_index),
+    """Query the daily-log-cache for today's task_list section boundaries.
+    Returns dict with 'task_list' key as (start_index, end_index),
     or None if not cached."""
     db = get_cache_db()
     entry = db.execute(
@@ -56,19 +56,13 @@ def get_section_boundaries(doc_id, today_str):
         "WHERE entry_id = ? AND section_type = 'task_list'",
         (entry["id"],),
     ).fetchone()
-    notes = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'notes'",
-        (entry["id"],),
-    ).fetchone()
     db.close()
 
-    if not task_list or not notes:
+    if not task_list:
         return None
 
     return {
         "task_list": (task_list["start_index"], task_list["end_index"]),
-        "notes": (notes["start_index"], notes["end_index"]),
     }
 
 
@@ -79,28 +73,6 @@ def get_section_boundaries(doc_id, today_str):
 
 # fetch_doc and extract_section_text are imported from lib.daily_log_utils
 from lib.daily_log_utils import fetch_doc  # noqa: E402
-
-
-def extract_heading3_titles(doc, section_start, section_end):
-    """Extract HEADING_3 titles from a section of the doc (live, not cached).
-    Strips trailing [event] or [task] link labels for dedup matching."""
-    titles = set()
-    body_content = doc.get("body", {}).get("content", [])
-    for element in body_content:
-        el_start = element.get("startIndex", 0)
-        if el_start < section_start or el_start >= section_end:
-            continue
-        paragraph = element.get("paragraph", {})
-        style = paragraph.get("paragraphStyle", {})
-        if style.get("namedStyleType") == "HEADING_3":
-            text = ""
-            for pe in paragraph.get("elements", []):
-                text += pe.get("textRun", {}).get("content", "")
-            title = text.strip()
-            # Strip trailing [event] or [task] link labels
-            title = re.sub(r"\s+\[(event|task)\]$", "", title)
-            titles.add(title)
-    return titles
 
 
 def find_subsection_boundary(doc, section_start, section_end, label_text):
@@ -210,17 +182,14 @@ def build_batch_update(
     new_priority_entries,
     new_waiting_items,
     current_waiting_titles,
-    new_notes_entries,
     priorities_insert_index,
     waiting_boundary,
-    notes_end_index,
     style,
     inherit_priority_bullet=False,
 ):
     """Build the batchUpdate JSON.
 
-    This may write to both the Task List section (priorities + waiting/blockers)
-    and the Notes section (new HEADING_3 sub-sections).
+    This writes to the Task List section (priorities + waiting/blockers).
 
     When inherit_priority_bullet is True, priority items are inserted before the
     trailing newline of the last existing bullet paragraph. New paragraphs
@@ -236,119 +205,6 @@ def build_batch_update(
     # We'll collect all insertion groups, then sort by index descending.
     # Each group: (insert_index, text, formatting_requests_fn)
     insertion_groups = []
-
-    # --- Notes HEADING_3 sub-sections ---
-    if new_notes_entries:
-        notes_text = ""
-        notes_link_info = []  # (offset_of_label_start, offset_of_label_end, url)
-        for item, item_type in new_notes_entries:
-            title = item["summary"] if item_type == "event" else item["title"]
-            if item_type == "event":
-                link_url = item.get("support_doc_url") or item.get("html_link", "")
-                link_label = "[event]"
-            else:
-                link_url = item.get("web_view_link", "")
-                link_label = "[task]"
-
-            if link_url:
-                heading_text = f"{title} {link_label}"
-                label_offset = utf16_len(notes_text) + utf16_len(title + " ")
-                label_end_offset = label_offset + utf16_len(link_label)
-                notes_link_info.append((label_offset, label_end_offset, link_url))
-            else:
-                heading_text = title
-            notes_text += f"{heading_text}\n"
-
-        def notes_formatting(base_index, text):
-            reqs = []
-            # Clear inherited link formatting from the insertion boundary
-            reqs.append({
-                "updateTextStyle": {
-                    "range": {
-                        "startIndex": base_index,
-                        "endIndex": base_index + utf16_len(text),
-                    },
-                    "textStyle": {},
-                    "fields": "link",
-                }
-            })
-            offset = 0
-            for item, item_type in new_notes_entries:
-                title = item["summary"] if item_type == "event" else item["title"]
-                if item_type == "event":
-                    link_url = item.get("support_doc_url") or item.get("html_link", "")
-                    link_label = "[event]"
-                else:
-                    link_url = item.get("web_view_link", "")
-                    link_label = "[task]"
-
-                if link_url:
-                    heading_line = f"{title} {link_label}"
-                else:
-                    heading_line = title
-
-                heading_start = base_index + offset
-                heading_end = heading_start + utf16_len(heading_line + "\n")
-
-                # HEADING_3 paragraph style
-                reqs.append(
-                    {
-                        "updateParagraphStyle": {
-                            "range": {
-                                "startIndex": heading_start,
-                                "endIndex": heading_end,
-                            },
-                            "paragraphStyle": {"namedStyleType": "HEADING_3"},
-                            "fields": "namedStyleType",
-                        }
-                    }
-                )
-
-                # Heading font
-                heading_text_style = {
-                    "weightedFontFamily": {
-                        "fontFamily": style["fonts"]["heading"],
-                    }
-                }
-                heading_fields = "weightedFontFamily"
-                if style["colors"].get("headingText"):
-                    heading_text_style["foregroundColor"] = {
-                        "color": {"rgbColor": style["colors"]["headingText"]}
-                    }
-                    heading_fields += ",foregroundColor"
-                reqs.append(
-                    {
-                        "updateTextStyle": {
-                            "range": {
-                                "startIndex": heading_start,
-                                "endIndex": heading_end,
-                            },
-                            "textStyle": heading_text_style,
-                            "fields": heading_fields,
-                        }
-                    }
-                )
-
-                offset += utf16_len(heading_line + "\n")
-
-            # Apply inline links on [event]/[task] labels
-            for label_offset, label_end_offset, link_url in notes_link_info:
-                reqs.append(
-                    {
-                        "updateTextStyle": {
-                            "range": {
-                                "startIndex": base_index + label_offset,
-                                "endIndex": base_index + label_end_offset,
-                            },
-                            "textStyle": {"link": {"url": link_url}},
-                            "fields": "link",
-                        }
-                    }
-                )
-
-            return reqs
-
-        insertion_groups.append((notes_end_index, notes_text, notes_formatting))
 
     # --- Waiting / Blockers content ---
     # We need to handle the waiting/blockers section. The approach:
@@ -604,9 +460,7 @@ def main():
         sys.exit(1)
 
     tl_start, tl_end = boundaries["task_list"]
-    notes_start, notes_end = boundaries["notes"]
     print(f"Task List section: index {tl_start} to {tl_end}")
-    print(f"Notes section: index {notes_start} to {notes_end}")
 
     # Step 3: Get timezone offset and fetch data
     tz_result = subprocess.run(
@@ -628,14 +482,10 @@ def main():
     task_list_text = extract_section_text(doc, tl_start, tl_end)
     existing_priorities = parse_existing_priority_titles(task_list_text)
 
-    # Parse existing HEADING_3 titles from Notes section (live, not cached)
-    existing_notes_titles = extract_heading3_titles(doc, notes_start, notes_end)
-
     # Parse existing waiting items
     current_waiting_titles = parse_existing_waiting_items(doc, tl_start, tl_end)
 
     print(f"Existing priorities: {len(existing_priorities)}")
-    print(f"Existing Notes headings: {len(existing_notes_titles)}")
     print(f"Existing waiting items: {len(current_waiting_titles)}")
 
     # Step 5: Compute diffs
@@ -659,23 +509,12 @@ def main():
         t for t in waiting_tasks if t["title"] not in current_waiting_titles
     ]
 
-    # New Notes HEADING_3 entries: events and tasks not already in Notes
-    new_notes_events = [
-        e for e in events if e["summary"] not in existing_notes_titles
-    ]
-    new_notes_tasks = [
-        t
-        for t in in_progress_tasks
-        if t["title"] not in existing_notes_titles
-    ]
-    new_notes_entries = sort_new_entries(new_notes_events, new_notes_tasks)
-
     # Determine if waiting/blockers needs updating
     # Rebuild the full set of waiting items from current + new
     all_waiting_set = current_waiting_titles | {t["title"] for t in waiting_tasks}
     waiting_changed = all_waiting_set != current_waiting_titles
 
-    if not new_priority_entries and not new_notes_entries and not waiting_changed:
+    if not new_priority_entries and not waiting_changed:
         print("Task List is already up to date.")
         sys.exit(0)
 
@@ -692,12 +531,6 @@ def main():
         print(f"\nWaiting/Blockers will be updated")
         for t in new_waiting_items:
             print(f"  + {t['title']}")
-
-    if new_notes_entries:
-        print(f"\nNew Notes headings to add: {len(new_notes_entries)}")
-        for item, item_type in new_notes_entries:
-            title = item["summary"] if item_type == "event" else item["title"]
-            print(f"  {title}")
 
     # Step 6: Find insertion points
     # Strategy B: inherit bullet list membership from existing priority bullets
@@ -734,10 +567,8 @@ def main():
         new_priority_entries=new_priority_entries if new_priority_entries else [],
         new_waiting_items=waiting_tasks if waiting_changed else [],
         current_waiting_titles=current_waiting_titles if waiting_changed else set(),
-        new_notes_entries=new_notes_entries if new_notes_entries else [],
         priorities_insert_index=priorities_insert_index,
         waiting_boundary=waiting_boundary,
-        notes_end_index=notes_end,
         style=style,
         inherit_priority_bullet=inherit_priority_bullet,
     )
@@ -761,8 +592,10 @@ def main():
         summary_parts.append(f"{len(new_priority_entries)} priority item(s)")
     if waiting_changed:
         summary_parts.append("waiting/blockers")
-    if new_notes_entries:
-        summary_parts.append(f"{len(new_notes_entries)} Notes heading(s)")
+
+    note_msg = f"Task list updated: {', '.join(summary_parts)}."
+    publish_note(note_msg, auto_confirm)
+
     print(f"\nDone. Updated: {', '.join(summary_parts)}.")
 
 

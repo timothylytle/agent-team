@@ -763,14 +763,35 @@ def main():
 
     print(f"Found {len(tickets)} active ticket(s)")
 
-    # Step 2: Check for existing support docs (duplicate detection)
+    # Step 2: Check for existing support docs (CRM-first, fallback to FreshDesk)
     tickets_needing_docs = []
     tickets_with_docs = []
     conversations_cache = {}  # ticket_id -> conversations list
 
+    # Build CRM ticket lookup once (freshdesk_id -> crm ticket)
+    print("  Loading CRM tickets for doc lookup...")
+    stdout, _, _ = run_cmd([CRM_SAFE, "tickets", "list"])
+    try:
+        crm_tickets_all = json.loads(stdout)
+    except json.JSONDecodeError:
+        crm_tickets_all = []
+    crm_ticket_lookup = {t["freshdesk_id"]: t for t in crm_tickets_all if t.get("freshdesk_id")}
+
     for ticket in tickets:
         tid = ticket["freshdesk_ticket_id"]
         print(f"  Checking ticket #{tid} for existing support doc...")
+
+        # 2a: Check CRM first
+        crm_ticket = crm_ticket_lookup.get(tid)
+        if crm_ticket and crm_ticket.get("support_doc_id"):
+            # CRM knows about this doc — no FreshDesk API call needed
+            crm_doc_id = crm_ticket["support_doc_id"]
+            tickets_with_docs.append({"ticket": ticket, "doc_id": crm_doc_id})
+            print(f"    Has doc (from CRM): {crm_doc_id}")
+            continue
+
+        # 2b: Fallback to FreshDesk scan
+        print(f"    No CRM record, scanning FreshDesk...")
         scan_result = scan_ticket_notes(tid, "docs.google.com/document")
         conversations_cache[tid] = scan_result["conversations"]
 
@@ -779,6 +800,20 @@ def main():
             if doc_id:
                 tickets_with_docs.append({"ticket": ticket, "doc_id": doc_id})
                 print(f"    Has existing doc: {doc_id}")
+
+                # Backfill CRM with discovered doc info
+                if crm_ticket:
+                    crm_tid = crm_ticket["id"]
+                    note_id = scan_result.get("note_id")
+                    update_data = {
+                        "support_doc_id": doc_id,
+                        "support_doc_url": f"https://docs.google.com/document/d/{doc_id}/edit",
+                    }
+                    if note_id:
+                        update_data["freshdesk_note_id"] = note_id
+                    run_cmd([CRM_SAFE, "tickets", "update", str(crm_tid),
+                             "--json", json.dumps(update_data)])
+                    print(f"    Backfilled CRM ticket #{crm_tid}")
             else:
                 # Has a note but couldn't parse doc ID
                 tickets_with_docs.append({"ticket": ticket, "doc_id": None})
@@ -1091,9 +1126,30 @@ def main():
             failed_docs.append({"ticket": t, "reason": "FreshDesk note failed", "doc_id": doc_id})
             continue
 
+        # Parse the FreshDesk note ID from the response
+        freshdesk_note_id = None
+        try:
+            note_response = json.loads(stdout)
+            freshdesk_note_id = note_response.get("id")
+        except (json.JSONDecodeError, TypeError):
+            print(f"  WARNING: Could not parse FreshDesk note ID from response")
+
         # 9d: Link in CRM
         link_doc_in_crm(doc_id, doc_name, web_view_link, ctx["company_id"])
         print(f"  Linked doc in CRM for company {ctx['company_name']}")
+
+        # 9e: Update CRM ticket with support doc info
+        crm_tid = ctx["crm_records"].get("crm_ticket_id")
+        if crm_tid:
+            update_data = {
+                "support_doc_id": doc_id,
+                "support_doc_url": web_view_link,
+            }
+            if freshdesk_note_id:
+                update_data["freshdesk_note_id"] = freshdesk_note_id
+            run_cmd([CRM_SAFE, "tickets", "update", str(crm_tid),
+                     "--json", json.dumps(update_data)])
+            print(f"  Updated CRM ticket #{crm_tid} with support doc info")
 
         created_docs.append({
             "ticket": t,

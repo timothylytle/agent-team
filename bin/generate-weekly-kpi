@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Weekly KPI report generator.
+
+Collects helpdesk metrics, calendar event counts, task completions, and
+support summary data for a Friday-through-Thursday week, prints a report,
+and inserts it into the Notes section of today's daily log.
+
+Usage:
+    bin/generate-weekly-kpi [--week-ending YYYY-MM-DD] [--auto-confirm] [--dry-run]
+"""
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    FRESHDESK_SAFE,
+    GWS_SAFE,
+    execute_batch_update,
+    fetch_doc,
+    get_cache_db,
+    publish_note,
+    read_configs,
+    run_cmd,
+    update_cache,
+    utf16_len,
+)
+
+
+# --- Date range computation ---
+
+
+def compute_week_range(week_ending_str=None):
+    """Compute Friday-through-Thursday date range.
+
+    Args:
+        week_ending_str: Optional YYYY-MM-DD string for the Thursday.
+            Defaults to the most recent Thursday (including today if Thursday).
+
+    Returns:
+        (week_start, week_end) as date objects (Friday and Thursday).
+    """
+    if week_ending_str:
+        week_end = datetime.strptime(week_ending_str, "%Y-%m-%d").date()
+    else:
+        today = datetime.now().date()
+        # Find most recent Thursday (weekday 3). If today is Thursday, use today.
+        days_since_thursday = (today.weekday() - 3) % 7
+        week_end = today - timedelta(days=days_since_thursday)
+
+    week_start = week_end - timedelta(days=6)
+    return week_start, week_end
+
+
+# --- Notes section boundaries ---
+
+
+def get_notes_boundaries(doc_id, today_str):
+    """Query the daily-log-cache for today's notes section boundaries.
+    Returns (start_index, end_index) or None if not cached."""
+    db = get_cache_db()
+    entry = db.execute(
+        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
+        (doc_id, today_str),
+    ).fetchone()
+    if not entry:
+        db.close()
+        return None
+    section = db.execute(
+        "SELECT start_index, end_index FROM sections "
+        "WHERE entry_id = ? AND section_type = 'notes'",
+        (entry["id"],),
+    ).fetchone()
+    db.close()
+    if not section:
+        return None
+    return section["start_index"], section["end_index"]
+
+
+# --- Data collection ---
+
+
+def fetch_tickets_opened(week_start, week_end):
+    """Count FreshDesk tickets created in the date range."""
+    week_start_str = week_start.strftime("%Y-%m-%d")
+    week_end_next_str = (week_end + timedelta(days=1)).strftime("%Y-%m-%d")
+    query = f"created_at:>'{week_start_str}' AND created_at:<'{week_end_next_str}'"
+
+    stdout, _, _ = run_cmd(
+        [FRESHDESK_SAFE, "tickets", "search", "--query", query]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse FreshDesk ticket search output", file=sys.stderr)
+        sys.exit(1)
+
+    total = data.get("total", 0)
+    print(f"  Tickets opened: {total}")
+    return total
+
+
+    # Responses to customers — from FreshDesk analytics report (manual input)
+    # No FreshDesk analytics API exists, so this is provided via --responses flag
+
+
+def fetch_email_requests():
+    """Email requests from customers — always 0 per policy."""
+    print("  Email requests: 0 (by policy)")
+    return 0
+
+
+def fetch_calendar_events(week_start, week_end):
+    """Fetch calendar events for the date range and count by color.
+
+    Returns:
+        (color_counts, meetings) where color_counts is a dict of
+        colorId -> count, and meetings is a list of (category, summary).
+    """
+    week_start_iso = week_start.strftime("%Y-%m-%d")
+    week_end_iso = week_end.strftime("%Y-%m-%d")
+
+    params = {
+        "calendarId": "primary",
+        "timeMin": f"{week_start_iso}T00:00:00Z",
+        "timeMax": f"{week_end_iso}T23:59:59Z",
+        "singleEvents": True,
+        "orderBy": "startTime",
+    }
+
+    print("  Fetching calendar events...")
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "calendar", "events", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse calendar events output", file=sys.stderr)
+        sys.exit(1)
+
+    items = data.get("items", [])
+
+    COLOR_LABELS = {
+        "4": "[support]",
+        "11": "[afterhours]",
+        "6": "[sales]",
+        "1": "[onboarding]",
+    }
+
+    color_counts = {"4": 0, "11": 0, "6": 0, "1": 0}
+    meetings = []
+
+    for event in items:
+        color_id = event.get("colorId")
+        if color_id in color_counts:
+            color_counts[color_id] += 1
+            summary = event.get("summary", "(No title)").strip()
+            label = COLOR_LABELS[color_id]
+            meetings.append((label, summary))
+
+    print(f"  Calendar events: {len(items)} total, "
+          f"{color_counts['4']} support, {color_counts['11']} afterhours, "
+          f"{color_counts['6']} sales, {color_counts['1']} onboarding")
+    return color_counts, meetings
+
+
+def fetch_completed_tasks(config, week_start, week_end):
+    """Fetch tasks completed in the date range.
+
+    Returns list of task title strings.
+    """
+    week_start_iso = week_start.strftime("%Y-%m-%d")
+    week_end_next_iso = (week_end + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    params = {
+        "tasklist": config["inProgressTaskListId"],
+        "showCompleted": True,
+        "showHidden": True,
+        "completedMin": f"{week_start_iso}T00:00:00.000Z",
+        "completedMax": f"{week_end_next_iso}T00:00:00.000Z",
+    }
+
+    print("  Fetching completed tasks...")
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "tasks", "tasks", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse tasks output", file=sys.stderr)
+        sys.exit(1)
+
+    tasks = []
+    for item in data.get("items", []):
+        title = item.get("title", "").strip()
+        if title:
+            tasks.append(title)
+
+    print(f"  Completed tasks: {len(tasks)}")
+    return tasks
+
+
+def fetch_upcoming_tasks(config):
+    """Fetch current in-progress tasks.
+
+    Returns list of task title strings.
+    """
+    params = {"tasklist": config["inProgressTaskListId"]}
+
+    print("  Fetching upcoming tasks...")
+    stdout, _, _ = run_cmd(
+        [GWS_SAFE, "tasks", "tasks", "list", "--params", json.dumps(params)]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse tasks output", file=sys.stderr)
+        sys.exit(1)
+
+    tasks = []
+    for item in data.get("items", []):
+        title = item.get("title", "").strip()
+        if title:
+            tasks.append(title)
+
+    print(f"  Upcoming tasks: {len(tasks)}")
+    return tasks
+
+
+def fetch_tickets_assigned():
+    """Count non-closed tickets (status 2, 3, 6, 7, 9)."""
+    query = "status:2 OR status:3 OR status:6 OR status:7 OR status:9"
+    stdout, _, _ = run_cmd(
+        [FRESHDESK_SAFE, "tickets", "search", "--query", query]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse FreshDesk search output", file=sys.stderr)
+        sys.exit(1)
+
+    count = data.get("total", 0)
+    print(f"  Tickets assigned: {count}")
+    return count
+
+
+    # Tickets resolved — from FreshDesk analytics report (manual input)
+    # No FreshDesk analytics API exists, so this is provided via --resolved flag
+
+
+# --- Report formatting ---
+
+
+def format_report(week_start, week_end, tickets_opened, responses,
+                  email_requests, color_counts, meetings, completed_tasks,
+                  upcoming_tasks, tickets_assigned, tickets_resolved):
+    """Build the report text.
+
+    Returns (heading, body) where heading is the HEADING_3 title line
+    and body is the NORMAL_TEXT content.
+    """
+    start_label = week_start.strftime("%b %-d")
+    end_label = week_end.strftime("%b %-d")
+    heading = f"KPI \u2014 Week of {start_label}\u2013{end_label}"
+
+    lines = []
+    # Support Calls = support + afterhours + onboarding combined
+    support_calls = color_counts["4"] + color_counts["11"] + color_counts["1"]
+
+    lines.append("Helpdesk Metrics:")
+    lines.append(f"  Opened Tickets: {tickets_opened}")
+    lines.append(f"  Responses to Customers: {responses}")
+    lines.append(f"  Email Requests: {email_requests}")
+    lines.append(f"  Support Calls with Customers: {support_calls}")
+    lines.append(f"  After Hours Support: {color_counts['11']}")
+    lines.append(f"  Sales Calls (Expert Engineer): {color_counts['6']}")
+
+    lines.append("")
+    lines.append("Meetings:")
+    if meetings:
+        for label, summary in meetings:
+            lines.append(f"  {label} {summary}")
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Completed Tasks:")
+    if completed_tasks:
+        for task in completed_tasks:
+            lines.append(f"  \u2022 {task}")
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Upcoming Tasks:")
+    if upcoming_tasks:
+        for task in upcoming_tasks:
+            lines.append(f"  \u2022 {task}")
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Support Summary:")
+    lines.append(f"  Tickets Assigned: {tickets_assigned}")
+    lines.append(f"  Tickets Resolved: {tickets_resolved}")
+    lines.append(f"  Responses to Customers: {responses}")
+
+    body = "\n".join(lines)
+    return heading, body
+
+
+# --- Doc insertion ---
+
+
+def build_kpi_batch_update(heading, body, insert_index, style):
+    """Build the batchUpdate JSON for inserting the KPI report.
+
+    Inserts HEADING_3 title + NORMAL_TEXT body at the given index.
+    """
+    heading_text = heading + "\n"
+    body_text = body + "\n"
+    full_text = heading_text + body_text
+
+    requests = []
+
+    # 1. Insert the full text block
+    requests.append({
+        "insertText": {
+            "location": {"index": insert_index},
+            "text": full_text,
+        }
+    })
+
+    # 2. Apply HEADING_3 style to the heading line
+    heading_start = insert_index
+    heading_end = insert_index + utf16_len(heading_text)
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": heading_start, "endIndex": heading_end},
+            "paragraphStyle": {"namedStyleType": "HEADING_3"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Apply NORMAL_TEXT style to the body
+    body_start = heading_end
+    body_end = insert_index + utf16_len(full_text)
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": body_start, "endIndex": body_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 4. Apply heading font styling
+    heading_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
+    }
+    heading_fields = "weightedFontFamily"
+    if style["colors"].get("headingText"):
+        heading_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["headingText"]}
+        }
+        heading_fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": heading_start, "endIndex": heading_end},
+            "textStyle": heading_text_style,
+            "fields": heading_fields,
+        }
+    })
+
+    # 5. Apply body font styling
+    body_text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    body_fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        body_text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        body_fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": body_start, "endIndex": body_end},
+            "textStyle": body_text_style,
+            "fields": body_fields,
+        }
+    })
+
+    return {"requests": requests}
+
+
+# --- Main ---
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate weekly KPI report and insert into daily log"
+    )
+    parser.add_argument(
+        "--week-ending",
+        help="Thursday ending the report week (YYYY-MM-DD). "
+             "Defaults to most recent Thursday.",
+    )
+    parser.add_argument(
+        "--auto-confirm", action="store_true",
+        help="Automatically confirm GWS writes",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show report without inserting into doc",
+    )
+    parser.add_argument(
+        "--responses", type=int, default=None,
+        help="Responses to customers (from FreshDesk analytics report)",
+    )
+    parser.add_argument(
+        "--resolved", type=int, default=None,
+        help="Tickets resolved (from FreshDesk analytics report)",
+    )
+    args = parser.parse_args()
+
+    # Step 1: Compute date range
+    week_start, week_end = compute_week_range(args.week_ending)
+    print(f"Weekly KPI Report: {week_start} (Fri) through {week_end} (Thu)")
+    print()
+
+    # Step 2: Collect data
+    print("Collecting data...")
+    tickets_opened = fetch_tickets_opened(week_start, week_end)
+    email_requests = fetch_email_requests()
+    color_counts, meetings = fetch_calendar_events(week_start, week_end)
+    config, style = read_configs()
+    completed_tasks = fetch_completed_tasks(config, week_start, week_end)
+    upcoming_tasks = fetch_upcoming_tasks(config)
+    tickets_assigned = fetch_tickets_assigned()
+
+    # Manual-input fields from FreshDesk analytics report
+    responses = args.responses
+    if responses is None:
+        responses = "___"
+        print("  Responses to customers: (provide via --responses)")
+    else:
+        print(f"  Responses to customers: {responses}")
+
+    tickets_resolved = args.resolved
+    if tickets_resolved is None:
+        tickets_resolved = "___"
+        print("  Tickets resolved: (provide via --resolved)")
+    else:
+        print(f"  Tickets resolved: {tickets_resolved}")
+
+    # Step 3: Format report
+    heading, body = format_report(
+        week_start, week_end, tickets_opened, responses, email_requests,
+        color_counts, meetings, completed_tasks, upcoming_tasks,
+        tickets_assigned, tickets_resolved,
+    )
+
+    print()
+    print("=" * 60)
+    print(heading)
+    print(body)
+    print("=" * 60)
+    print()
+
+    if args.dry_run:
+        print("Dry-run mode: report not inserted into daily log.")
+        return
+
+    # Step 4: Insert into daily log
+    doc_id = config["documentId"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    boundaries = get_notes_boundaries(doc_id, today_str)
+    if not boundaries:
+        print(
+            "ERROR: No cached entry for today. Run /daily-log first to create the entry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    section_start, section_end = boundaries
+    print(f"Notes section: index {section_start} to {section_end}")
+
+    # Insert at the end of the Notes section
+    insert_index = section_end
+    print(f"Insert index: {insert_index}")
+
+    batch = build_kpi_batch_update(heading, body, insert_index, style)
+    success = execute_batch_update(doc_id, batch, args.auto_confirm)
+
+    if not success:
+        sys.exit(2)
+
+    # Step 5: Update cache
+    update_cache(doc_id)
+
+    # Step 6: Publish note
+    start_label = week_start.strftime("%b %-d")
+    end_label = week_end.strftime("%b %-d")
+    publish_note(
+        f"Weekly KPI generated for {start_label}-{end_label}",
+        args.auto_confirm,
+    )
+
+    print("\nDone. KPI report inserted into Notes section.")
+
+
+if __name__ == "__main__":
+    main()

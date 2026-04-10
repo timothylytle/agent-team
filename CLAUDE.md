@@ -67,6 +67,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | Task List | Updates Task List section of daily log with calendar events, tasks, and waiting/blockers | `.claude/skills/task-list/SKILL.md` |
 | Email | Updates Email section of daily log with timestamped summary of inbox emails | `.claude/skills/email/SKILL.md` |
 | Publish to Notes | Publishes a timestamped message to the Notes section of today's daily log | `.claude/skills/publish-to-notes/SKILL.md` |
+| KPI | Generates weekly KPI report (Friday-Thursday) with helpdesk metrics, meetings, tasks, and support summary | `.claude/skills/kpi/SKILL.md` |
 | Project | Development Project Manager — creates, researches, and tracks development projects | `.claude/skills/project/SKILL.md` |
 
 ## Hiring Process

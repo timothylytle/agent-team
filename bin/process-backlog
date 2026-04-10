@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Backlog processor.
+
+Reads tasks from the backlog Google Tasks list, routes each task based on
+title keywords, processes them, and marks completed tasks as done.
+
+Usage:
+    bin/process-backlog --auto-confirm
+    bin/process-backlog --dry-run
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    GWS_SAFE,
+    publish_note,
+    read_configs,
+    run_cmd,
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MANAGE_TASKS = REPO_ROOT / "bin" / "manage-tasks"
+
+# Skills that can be auto-invoked with no arguments
+SKILL_ROUTES = {
+    'daily-log': ['bin/create-daily-log', '--auto-confirm'],
+    'task-list': ['bin/update-task-list', '--auto-confirm'],
+    'open-tickets': ['bin/update-open-tickets', '--auto-confirm'],
+    'email': ['bin/update-email', '--auto-confirm'],
+    'kpi': ['bin/generate-weekly-kpi', '--auto-confirm'],
+    'support-notes': ['bin/update-support-notes', '--auto-confirm'],
+    'support-calendar': ['bin/update-support-calendar', '--auto-confirm'],
+}
+
+# Pattern: [keyword] or [skill:name]
+KEYWORD_RE = re.compile(r'^\[([^\]]+)\]\s*(.*)')
+
+
+def parse_routing(title):
+    """Parse a task title for routing keyword.
+
+    Returns (keyword, rest_of_title) or (None, title) if no keyword found.
+    """
+    m = KEYWORD_RE.match(title)
+    if not m:
+        return None, title
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def fetch_backlog_tasks(config):
+    """Fetch all tasks from the backlog list via gws-safe."""
+    list_id = config.get('backlogTaskListId')
+    if not list_id:
+        print("ERROR: config key 'backlogTaskListId' not found in daily_log.json", file=sys.stderr)
+        sys.exit(1)
+
+    params = json.dumps({'tasklist': list_id, 'showCompleted': False, 'showAssigned': True})
+    stdout, _, _ = run_cmd(
+        [str(GWS_SAFE), 'tasks', 'tasks', 'list', '--params', params]
+    )
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse backlog tasks output", file=sys.stderr)
+        sys.exit(1)
+
+    return data.get('items', [])
+
+
+def run_skill(skill_name, dry_run):
+    """Run a skill script. Returns True on success."""
+    cmd_parts = SKILL_ROUTES[skill_name]
+    cmd = [str(REPO_ROOT / cmd_parts[0])] + cmd_parts[1:]
+
+    if dry_run:
+        print(f"  [dry-run] Would run: {' '.join(cmd)}")
+        return True
+
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        print(f"  ERROR: skill {skill_name} failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def run_ideas(title_rest, notes, dry_run):
+    """Run the ideas handler. Returns True on success."""
+    idea_title = title_rest or "Untitled idea"
+    analysis = notes or "Submitted via backlog"
+
+    cmd = [
+        str(REPO_ROOT / 'bin' / 'update-ideas-log'),
+        '--title', idea_title,
+        '--analysis', analysis,
+        '--auto-confirm',
+    ]
+
+    if dry_run:
+        print(f"  [dry-run] Would run: {' '.join(cmd)}")
+        return True
+
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        print(f"  ERROR: ideas handler failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def run_tasks(title_rest, notes, dry_run):
+    """Run the tasks handler. Creates a task on the todo list. Returns True on success."""
+    task_title = title_rest or "Untitled task"
+
+    cmd = [
+        str(MANAGE_TASKS), 'create',
+        '--list', 'todo',
+        '--title', task_title,
+        '--auto-confirm',
+    ]
+    if notes:
+        cmd += ['--notes', notes]
+
+    if dry_run:
+        print(f"  [dry-run] Would run: {' '.join(cmd)}")
+        return True
+
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        print(f"  ERROR: tasks handler failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def create_followup(original_title, reason, dry_run):
+    """Create a follow-up task on the todo list. Returns True on success."""
+    cmd = [
+        str(MANAGE_TASKS), 'create',
+        '--list', 'todo',
+        '--title', f"Review: {original_title}",
+        '--notes', reason,
+        '--auto-confirm',
+    ]
+
+    if dry_run:
+        print(f"  [dry-run] Would create follow-up: Review: {original_title}")
+        return True
+
+    print(f"  Creating follow-up task: Review: {original_title}")
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        print(f"  ERROR: follow-up creation failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def complete_task(task_id, dry_run):
+    """Mark a backlog task as complete. Returns True on success."""
+    cmd = [
+        str(MANAGE_TASKS), 'complete',
+        '--list', 'backlog',
+        '--task-id', task_id,
+        '--auto-confirm',
+    ]
+
+    if dry_run:
+        print(f"  [dry-run] Would mark task {task_id} as complete")
+        return True
+
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        print(f"  ERROR: failed to complete task {task_id} (exit {result.returncode})", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def process_task(task, dry_run):
+    """Process a single backlog task. Returns (success, is_followup)."""
+    title = task.get('title', '').strip()
+    task_id = task.get('id', '')
+    notes = task.get('notes', '').strip()
+
+    keyword, rest = parse_routing(title)
+
+    if keyword is None:
+        # No keyword -- create follow-up for clarification
+        return create_followup(title, "No routing keyword found in task title", dry_run), True
+
+    if keyword.startswith('skill:'):
+        skill_name = keyword[len('skill:'):]
+        if skill_name in SKILL_ROUTES:
+            return run_skill(skill_name, dry_run), False
+        else:
+            return create_followup(title, f"Unknown skill: {skill_name}", dry_run), True
+
+    if keyword == 'ideas':
+        return run_ideas(rest, notes, dry_run), False
+
+    if keyword in ('task', 'tasks'):
+        return run_tasks(rest, notes, dry_run), False
+
+    if keyword == 'project':
+        return create_followup(title, "Project task requires user scoping", dry_run), True
+
+    if keyword == 'support':
+        return create_followup(title, "Support task requires manual routing", dry_run), True
+
+    # Unknown keyword -- create follow-up
+    return create_followup(title, f"Unknown keyword: [{keyword}]", dry_run), True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Process backlog tasks")
+    parser.add_argument('--auto-confirm', action='store_true', help='Auto-confirm all writes')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be processed without executing')
+    args = parser.parse_args()
+
+    if not args.auto_confirm and not args.dry_run:
+        print("ERROR: must specify --auto-confirm or --dry-run", file=sys.stderr)
+        sys.exit(1)
+
+    dry_run = args.dry_run
+
+    # Step 1: Read configs
+    config, _ = read_configs()
+
+    # Sync tasks to CRM before processing
+    print("Syncing tasks...")
+    result = subprocess.run([str(REPO_ROOT / 'bin' / 'sync-tasks')], text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+
+    # Step 2: List backlog tasks
+    print("Fetching backlog tasks...")
+    tasks = fetch_backlog_tasks(config)
+
+    if not tasks:
+        print("No backlog tasks to process.")
+        return
+
+    print(f"Found {len(tasks)} backlog task(s).\n")
+
+    # Step 3: Process each task
+    completed = 0
+    failed = 0
+    followups = 0
+
+    for task in tasks:
+        title = task.get('title', '(No title)').strip()
+        task_id = task.get('id', '')
+        print(f"Processing: {title}")
+
+        success, is_followup = process_task(task, dry_run)
+
+        if is_followup:
+            followups += 1
+
+        if success:
+            if complete_task(task_id, dry_run):
+                completed += 1
+            else:
+                failed += 1
+        else:
+            failed += 1
+
+        print()
+
+    # Step 4: Summary
+    summary = f"Backlog processed: {completed} completed, {failed} failed, {followups} follow-ups created"
+    print(summary)
+
+    if not dry_run:
+        publish_note(summary, auto_confirm=True)
+
+    if not dry_run and (completed > 0 or followups > 0):
+        print("\nUpdating task list in daily log...")
+        subprocess.run([str(REPO_ROOT / 'bin' / 'update-task-list'), '--auto-confirm'], text=True, capture_output=True)
+
+
+if __name__ == '__main__':
+    main()

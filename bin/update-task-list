@@ -20,59 +20,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.daily_log_utils import (
+    ensure_cache_fresh,
     execute_batch_update,
     extract_section_text,
     fetch_calendar_events,
+    fetch_doc,
     fetch_tasks,
     find_last_bullet_end_in_section,
     format_event_time,
-    get_cache_db,
+    get_section,
     publish_note,
     read_configs,
     sort_entries,
     update_cache,
     utf16_len,
 )
-
-
-# --- Step 2: Check cache for section boundaries ---
-
-
-def get_section_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's task_list section boundaries.
-    Returns dict with 'task_list' key as (start_index, end_index),
-    or None if not cached."""
-    db = get_cache_db()
-    entry = db.execute(
-        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
-        (doc_id, today_str),
-    ).fetchone()
-    if not entry:
-        db.close()
-        return None
-
-    task_list = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'task_list'",
-        (entry["id"],),
-    ).fetchone()
-    db.close()
-
-    if not task_list:
-        return None
-
-    return {
-        "task_list": (task_list["start_index"], task_list["end_index"]),
-    }
-
-
-# --- Step 3: Fetch data (delegated to shared module) ---
-
-
-# --- Step 4: Fetch doc and parse sections ---
-
-# fetch_doc and extract_section_text are imported from lib.daily_log_utils
-from lib.daily_log_utils import fetch_doc  # noqa: E402
 
 
 def find_subsection_boundary(doc, section_start, section_end, label_text):
@@ -450,8 +412,11 @@ def main():
     print(f"Updating Task List for {today_heading}")
     print(f"Document ID: {doc_id}")
 
-    # Step 2: Check cache for section boundaries
-    boundaries = get_section_boundaries(doc_id, today_str)
+    # Step 2: Fetch doc and check cache freshness
+    doc = fetch_doc(doc_id)
+    ensure_cache_fresh(doc, doc_id)
+
+    boundaries = get_section(doc_id, today_str, "task_list")
     if not boundaries:
         print(
             "ERROR: No cached entry for today. Run /daily-log first to create the entry.",
@@ -459,7 +424,7 @@ def main():
         )
         sys.exit(1)
 
-    tl_start, tl_end = boundaries["task_list"]
+    tl_start, tl_end = boundaries
     print(f"Task List section: index {tl_start} to {tl_end}")
 
     # Step 3: Get timezone offset and fetch data
@@ -475,8 +440,7 @@ def main():
     print(f"Found {len(in_progress_tasks)} in-progress task(s)")
     print(f"Found {len(waiting_tasks)} waiting task(s) due today")
 
-    # Step 4: Fetch doc and parse current content
-    doc = fetch_doc(doc_id)
+    # Step 4: Parse current content from doc
 
     # Parse existing priorities from Task List section
     task_list_text = extract_section_text(doc, tl_start, tl_end)

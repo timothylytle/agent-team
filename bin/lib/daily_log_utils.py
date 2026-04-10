@@ -853,6 +853,54 @@ def execute_batch_update(doc_id, batch_json, auto_confirm):
         sys.exit(1)
 
 
+# --- Cache freshness check and section query ---
+
+
+def ensure_cache_fresh(doc, doc_id):
+    """If the doc's revisionId differs from the cached one, reparse and update cache."""
+    doc_revision = doc.get("revisionId", "")
+    db = get_cache_db()
+    row = db.execute(
+        "SELECT revision_id FROM documents WHERE document_id = ?",
+        (doc_id,),
+    ).fetchone()
+    db.close()
+    cached_revision = row["revision_id"] if row else ""
+    if doc_revision != cached_revision:
+        print(f"Cache stale (doc revision {doc_revision[:8]}... != cached {cached_revision[:8]}...). Reparsing...")
+        update_cache(doc_id)
+
+
+def get_section(doc_id, today_str, section_type):
+    """Query the daily-log-cache for a section's boundaries.
+
+    Args:
+        doc_id: Google Doc ID
+        today_str: date string YYYY-MM-DD
+        section_type: one of 'task_list', 'open_tickets', 'email',
+                      'thoughts_ideas', 'notes', 'random_fact'
+
+    Returns (start_index, end_index) or None if not cached.
+    """
+    db = get_cache_db()
+    entry = db.execute(
+        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
+        (doc_id, today_str),
+    ).fetchone()
+    if not entry:
+        db.close()
+        return None
+    section = db.execute(
+        "SELECT start_index, end_index FROM sections "
+        "WHERE entry_id = ? AND section_type = ?",
+        (entry["id"], section_type),
+    ).fetchone()
+    db.close()
+    if not section:
+        return None
+    return section["start_index"], section["end_index"]
+
+
 # --- Cache update ---
 
 

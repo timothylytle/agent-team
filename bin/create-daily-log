@@ -165,14 +165,14 @@ def build_entry_text(today_heading, events, in_progress_tasks, waiting_tasks, ti
     # Empty line for user to type in
     add_line("", "NORMAL_TEXT")
 
-    # Agent Log heading
-    add_line("Agent Log:", "HEADING_2")
-
-    # Empty line (populated by publish-to-notes)
-    add_line("", "NORMAL_TEXT")
-
     # Notes heading
     add_line("Notes:", "HEADING_2")
+
+    # Empty line for user notes
+    add_line("", "NORMAL_TEXT")
+
+    # Agent Log heading
+    add_line("Agent Log:", "HEADING_2")
 
     # Build the full text block (each line gets a trailing newline)
     full_text = "\n".join(lines) + "\n"

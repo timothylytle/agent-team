@@ -39,3 +39,9 @@ bin/manage-tasks move --task-id "TASK_ID" --from backlog --to in_progress --auto
 ## After execution
 
 Report the script output to the user. If the script exits with a non-zero code, report the error.
+
+After any write operation (create, complete, move), also run the task list update:
+
+```bash
+bin/update-task-list --auto-confirm
+```

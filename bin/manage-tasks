@@ -31,13 +31,14 @@ from lib.daily_log_utils import (
 
 # --- List name to ID mapping ---
 
-LIST_NAMES = ('in_progress', 'waiting', 'backlog', 'todo')
+LIST_NAMES = ('in_progress', 'waiting', 'backlog', 'todo', 'done')
 
 CONFIG_KEYS = {
     'in_progress': 'inProgressTaskListId',
     'waiting': 'waitingTaskListId',
     'backlog': 'backlogTaskListId',
     'todo': 'todoTaskListId',
+    'done': 'doneTaskListId',
 }
 
 

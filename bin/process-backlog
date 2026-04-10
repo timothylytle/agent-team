@@ -254,6 +254,12 @@ def main():
     # Step 1: Read configs
     config, _ = read_configs()
 
+    # Sync tasks to CRM before processing
+    print("Syncing tasks...")
+    result = subprocess.run([str(REPO_ROOT / 'bin' / 'sync-tasks')], text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+
     # Step 2: List backlog tasks
     print("Fetching backlog tasks...")
     tasks = fetch_backlog_tasks(config)
@@ -295,6 +301,10 @@ def main():
 
     if not dry_run:
         publish_note(summary, auto_confirm=True)
+
+    if not dry_run and (completed > 0 or followups > 0):
+        print("\nUpdating task list in daily log...")
+        subprocess.run([str(REPO_ROOT / 'bin' / 'update-task-list'), '--auto-confirm'], text=True, capture_output=True)
 
 
 if __name__ == '__main__':

@@ -352,7 +352,7 @@ def cmd_tickets_list(args, cmd_str):
         params.append(args.company_id)
     if args.status is not None:
         conditions.append('t.status = ?')
-        params.append(args.status)
+        params.append(int(args.status))
     if conditions:
         query += ' WHERE ' + ' AND '.join(conditions)
     query += ' ORDER BY t.created_at DESC'
@@ -952,6 +952,136 @@ def cmd_ideas_update(args, cmd_str):
     log_entry(cmd_str, 'CONFIRMED', 0)
 
 
+# --- Command: tasks ---
+
+def cmd_tasks_list(args, cmd_str):
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    query = (
+        'SELECT t.*, c.name AS company_name '
+        'FROM tasks t '
+        'LEFT JOIN companies c ON t.company_id = c.id'
+    )
+    params = []
+    conditions = []
+    if args.task_list is not None:
+        conditions.append('t.task_list = ?')
+        params.append(args.task_list)
+    if args.status is not None:
+        conditions.append('t.status = ?')
+        params.append(args.status)
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    query += ' ORDER BY t.created_at DESC'
+    rows = db.execute(query, params).fetchall()
+    output_json(rows_to_list(rows))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_tasks_view(args, cmd_str):
+    if args.id is None:
+        deny('tasks view requires an ID', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute('SELECT * FROM tasks WHERE id = ?', (args.id,)).fetchone()
+    if not row:
+        output_json({'error': f'task {args.id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    output_json(dict(row))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_tasks_find(args, cmd_str):
+    if args.google_task_id is None:
+        deny('tasks find requires --google-task-id', cmd_str)
+    log_entry(cmd_str, 'ALLOWED')
+    db = get_db()
+    row = db.execute(
+        'SELECT * FROM tasks WHERE google_task_id = ?', (args.google_task_id,)
+    ).fetchone()
+    if not row:
+        output_json({'error': f'task with google_task_id {args.google_task_id} not found'})
+        log_entry(cmd_str, 'ALLOWED', 1)
+        sys.exit(1)
+    output_json(dict(row))
+    log_entry(cmd_str, 'ALLOWED', 0)
+
+
+def cmd_tasks_create(args, cmd_str):
+    data = _parse_json_arg(args, cmd_str)
+    if 'google_task_id' not in data or not data['google_task_id']:
+        deny('tasks create requires "google_task_id" in JSON', cmd_str)
+    if 'task_list' not in data or not data['task_list']:
+        deny('tasks create requires "task_list" in JSON', cmd_str)
+    if 'title' not in data or not data['title']:
+        deny('tasks create requires "title" in JSON', cmd_str)
+    _write_gate(args, cmd_str, 'Create task', data)
+    db = get_db()
+    cols = []
+    vals = []
+    allowed = ('google_task_id', 'task_list', 'title', 'notes', 'status',
+               'due_date', 'completed_at', 'parent_task_id', 'position',
+               'company_id', 'ticket_id', 'project_id')
+    for k in allowed:
+        if k in data:
+            cols.append(k)
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    placeholders = ', '.join('?' for _ in cols)
+    col_str = ', '.join(cols)
+    try:
+        cursor = db.execute(f'INSERT INTO tasks ({col_str}) VALUES ({placeholders})', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM tasks WHERE id = ?', (cursor.lastrowid,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
+def cmd_tasks_update(args, cmd_str):
+    if args.id is None:
+        deny('tasks update requires an ID', cmd_str)
+    data = _parse_json_arg(args, cmd_str)
+    if not data:
+        deny('tasks update requires at least one field in JSON', cmd_str)
+    _write_gate(args, cmd_str, f'Update task {args.id}', data)
+    db = get_db()
+    existing = db.execute('SELECT id FROM tasks WHERE id = ?', (args.id,)).fetchone()
+    if not existing:
+        output_json({'error': f'task {args.id} not found'})
+        sys.exit(1)
+    allowed = ('google_task_id', 'task_list', 'title', 'notes', 'status',
+               'due_date', 'completed_at', 'parent_task_id', 'position',
+               'company_id', 'ticket_id', 'project_id')
+    sets = []
+    vals = []
+    for k in allowed:
+        if k in data:
+            sets.append(f'{k} = ?')
+            v = data[k]
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v)
+            vals.append(v)
+    if not sets:
+        deny('no valid fields to update', cmd_str)
+    sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+    vals.append(args.id)
+    try:
+        db.execute(f'UPDATE tasks SET {", ".join(sets)} WHERE id = ?', vals)
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        db.close()
+        deny(f"Database integrity error: {e}", cmd_str)
+    row = db.execute('SELECT * FROM tasks WHERE id = ?', (args.id,)).fetchone()
+    output_json(dict(row))
+    log_entry(cmd_str, 'CONFIRMED', 0)
+
+
 # --- Helpers ---
 
 def _parse_json_arg(args, cmd_str):
@@ -997,6 +1127,12 @@ def _build_cmd_str(args):
     if getattr(args, 'project_id', None) is not None:
         parts.append('--project-id')
         parts.append(str(args.project_id))
+    if getattr(args, 'task_list', None) is not None:
+        parts.append('--task-list')
+        parts.append(args.task_list)
+    if getattr(args, 'google_task_id', None) is not None:
+        parts.append('--google-task-id')
+        parts.append(args.google_task_id)
     return ' '.join(parts)
 
 
@@ -1014,17 +1150,19 @@ def build_parser():
         prog='crm-safe',
         description='Safe CRM database wrapper',
     )
-    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files', 'meetings', 'emails', 'projects', 'ideas'])
+    parser.add_argument('resource', choices=['companies', 'contacts', 'tickets', 'files', 'meetings', 'emails', 'projects', 'ideas', 'tasks'])
     parser.add_argument('action')
     parser.add_argument('id', nargs='?', type=int, default=None)
     parser.add_argument('--json', dest='json', default=None)
     parser.add_argument('--company-id', type=int, default=None)
     parser.add_argument('--file-id', type=int, default=None)
-    parser.add_argument('--status', type=int, default=None)
+    parser.add_argument('--status', default=None)
     parser.add_argument('--ticket-id', type=int, default=None)
     parser.add_argument('--contact-id', type=int, default=None)
     parser.add_argument('--status-id', type=int, default=None)
     parser.add_argument('--project-id', type=int, default=None)
+    parser.add_argument('--task-list', default=None)
+    parser.add_argument('--google-task-id', default=None)
     parser.add_argument('--confirmed', default=None)
     return parser
 
@@ -1063,6 +1201,11 @@ ROUTES = {
     'files:create': cmd_files_create,
     'files:link': cmd_files_link,
     'files:unlink': cmd_files_unlink,
+    'tasks:list': cmd_tasks_list,
+    'tasks:view': cmd_tasks_view,
+    'tasks:find': cmd_tasks_find,
+    'tasks:create': cmd_tasks_create,
+    'tasks:update': cmd_tasks_update,
 }
 
 

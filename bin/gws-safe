@@ -58,6 +58,9 @@ is_confirmed_eligible() {
     "gmail users drafts create"
     "docs documents batchUpdate"
     "docs documents create"
+    "tasks tasks insert"
+    "tasks tasks patch"
+    "tasks tasks update"
   )
   local -a eligible_helpers=(+send +reply +triage +upload +append +write)
 
@@ -310,7 +313,7 @@ check_write_dryrun() {
   # Actually, let's redesign: caller passes tokens then a separator then original args.
   # Simpler: just accept original_args as a global.
 
-  local -a write_ops=(create update insert send copy quickAdd patch append batchUpdate)
+  local -a write_ops=(create update insert send copy quickAdd patch append batchUpdate move)
   # + helper commands that are write operations
   local -a write_helpers=(+send +reply +triage +upload +append +write)
 

@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Google Tasks management with CRM tracking.
+
+Creates, lists, completes, and moves tasks across multiple Google Task lists
+(in_progress, waiting, backlog), syncing each operation to the CRM database.
+
+Usage:
+    bin/manage-tasks create --list backlog --title "Task title" [--notes "..."] [--due "2026-04-15"] [--auto-confirm]
+    bin/manage-tasks list --list backlog
+    bin/manage-tasks complete --list backlog --task-id "TASK_ID" [--auto-confirm]
+    bin/manage-tasks move --task-id "TASK_ID" --from backlog --to in_progress [--auto-confirm]
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    GWS_SAFE,
+    CRM_SAFE,
+    publish_note,
+    read_configs,
+    run_cmd,
+)
+
+# --- List name to ID mapping ---
+
+LIST_NAMES = ('in_progress', 'waiting', 'backlog')
+
+CONFIG_KEYS = {
+    'in_progress': 'inProgressTaskListId',
+    'waiting': 'waitingTaskListId',
+    'backlog': 'backlogTaskListId',
+}
+
+
+def get_list_id(config, list_name):
+    """Resolve a list name to a Google Tasks list ID."""
+    key = CONFIG_KEYS.get(list_name)
+    if not key:
+        print(f"ERROR: unknown list name '{list_name}'. Must be one of: {', '.join(LIST_NAMES)}", file=sys.stderr)
+        sys.exit(1)
+    list_id = config.get(key)
+    if not list_id:
+        print(f"ERROR: config key '{key}' not found in daily_log.json", file=sys.stderr)
+        sys.exit(1)
+    return list_id
+
+
+# --- GWS write helper (handles dry-run/confirm flow) ---
+
+def gws_write(args_list, auto_confirm, dry_run=False):
+    """Execute a gws-safe write command with nonce handling.
+
+    Returns (stdout, success). If dry_run is True, only shows what would happen.
+    """
+    if dry_run:
+        cmd = [str(GWS_SAFE)] + [str(a) for a in args_list] + ['--dry-run']
+        stdout, stderr, rc = run_cmd(cmd, check=False)
+        print("Dry-run output:")
+        if stdout.strip():
+            print(stdout.strip())
+        if stderr.strip():
+            print(stderr.strip(), file=sys.stderr)
+        return stdout, True
+
+    # First call: will get dry-run enforced (exit code 2)
+    cmd = [str(GWS_SAFE)] + [str(a) for a in args_list]
+    stdout, stderr, rc = run_cmd(cmd, check=False)
+
+    if rc == 2:
+        # Parse nonce from stderr
+        nonce_match = re.search(r'--confirmed\s+([a-f0-9]+)', stderr)
+        if not nonce_match:
+            print("ERROR: could not parse nonce from dry-run output", file=sys.stderr)
+            print(f"stderr: {stderr}", file=sys.stderr)
+            sys.exit(1)
+
+        nonce = nonce_match.group(1)
+
+        if stdout.strip():
+            print("Dry-run output:")
+            print(stdout.strip())
+
+        if auto_confirm:
+            print(f"Auto-confirming with nonce {nonce}...")
+            confirm_cmd = cmd + ['--confirmed', nonce]
+            stdout2, stderr2, rc2 = run_cmd(confirm_cmd, check=False)
+            if rc2 != 0:
+                print(f"ERROR: confirmed command failed with exit code {rc2}", file=sys.stderr)
+                if stderr2:
+                    print(f"  stderr: {stderr2.strip()}", file=sys.stderr)
+                sys.exit(1)
+            print("Command confirmed and executed successfully.")
+            return stdout2, True
+        else:
+            print(f"\nDry-run enforced. To confirm, re-run with --auto-confirm or manually run:")
+            print(f"  {' '.join(str(a) for a in cmd)} --confirmed {nonce}")
+            return stdout, False
+    elif rc == 0:
+        return stdout, True
+    else:
+        print(f"ERROR: command failed with exit code {rc}", file=sys.stderr)
+        if stderr:
+            print(f"  stderr: {stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+
+# --- CRM helper ---
+
+def crm_upsert_task(google_task_id, task_list, title, notes=None, status='needsAction',
+                    due_date=None, completed_at=None, parent_task_id=None, position=None):
+    """Create or update a task record in the CRM."""
+    # Check if task already exists
+    stdout, stderr, rc = run_cmd(
+        [str(CRM_SAFE), 'tasks', 'find', '--google-task-id', google_task_id],
+        check=False,
+    )
+
+    data = {
+        'google_task_id': google_task_id,
+        'task_list': task_list,
+        'title': title,
+        'status': status,
+    }
+    if notes:
+        data['notes'] = notes
+    if due_date:
+        data['due_date'] = due_date
+    if completed_at:
+        data['completed_at'] = completed_at
+    if parent_task_id:
+        data['parent_task_id'] = parent_task_id
+    if position:
+        data['position'] = position
+
+    if rc == 0:
+        # Task exists, update it
+        try:
+            existing = json.loads(stdout)
+            task_id = existing['id']
+        except (json.JSONDecodeError, KeyError):
+            print("ERROR: failed to parse existing task from CRM", file=sys.stderr)
+            sys.exit(1)
+        run_cmd(
+            [str(CRM_SAFE), 'tasks', 'update', str(task_id), '--json', json.dumps(data)],
+            check=False,
+        )
+        print(f"CRM task {task_id} updated.")
+    else:
+        # Task doesn't exist, create it
+        stdout2, stderr2, rc2 = run_cmd(
+            [str(CRM_SAFE), 'tasks', 'create', '--json', json.dumps(data)],
+            check=False,
+        )
+        if rc2 == 0:
+            try:
+                created = json.loads(stdout2)
+                print(f"CRM task {created['id']} created.")
+            except (json.JSONDecodeError, KeyError):
+                print("CRM task created.")
+        else:
+            print(f"WARNING: CRM task create failed: {stderr2}", file=sys.stderr)
+
+
+# --- Subcommands ---
+
+def cmd_create(args, config):
+    """Create a new task on a specified list."""
+    list_id = get_list_id(config, args.list)
+    print(f"Creating task on '{args.list}' list...")
+    print(f"  Title: {args.title}")
+
+    # Build Google Tasks API request
+    task_body = {'title': args.title}
+    if args.notes:
+        task_body['notes'] = args.notes
+        print(f"  Notes: {args.notes}")
+    if args.due:
+        task_body['due'] = f"{args.due}T00:00:00.000Z"
+        print(f"  Due: {args.due}")
+
+    params = json.dumps({'tasklist': list_id})
+    body = json.dumps(task_body)
+
+    gws_args = ['tasks', 'tasks', 'insert', '--params', params, '--json', body]
+
+    if args.dry_run:
+        gws_write(gws_args, auto_confirm=False, dry_run=True)
+        return
+
+    stdout, success = gws_write(gws_args, args.auto_confirm)
+    if not success:
+        return
+
+    # Parse response to get task ID
+    try:
+        result = json.loads(stdout)
+        google_task_id = result['id']
+        title = result.get('title', args.title)
+        print(f"  Google Task ID: {google_task_id}")
+    except (json.JSONDecodeError, KeyError):
+        print("WARNING: could not parse task ID from response", file=sys.stderr)
+        return
+
+    # Upsert to CRM
+    crm_upsert_task(
+        google_task_id=google_task_id,
+        task_list=args.list,
+        title=title,
+        notes=args.notes,
+        due_date=args.due,
+        position=result.get('position'),
+        parent_task_id=result.get('parent'),
+    )
+
+    publish_note(f"Task created: {title} [{args.list}]", args.auto_confirm)
+    print(f"\nDone. Task '{title}' created on {args.list} list.")
+
+
+def cmd_list(args, config):
+    """List tasks on a specified list."""
+    list_id = get_list_id(config, args.list)
+    print(f"Listing tasks on '{args.list}' list...\n")
+
+    params = json.dumps({'tasklist': list_id})
+    stdout, _, _ = run_cmd(
+        [str(GWS_SAFE), 'tasks', 'tasks', 'list', '--params', params]
+    )
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse tasks output", file=sys.stderr)
+        sys.exit(1)
+
+    items = data.get('items', [])
+    if not items:
+        print("No tasks found.")
+        return
+
+    for i, item in enumerate(items, 1):
+        title = item.get('title', '(No title)').strip()
+        status = item.get('status', 'unknown')
+        task_id = item.get('id', '')
+        due = item.get('due', '')
+        notes = item.get('notes', '')
+
+        status_icon = '[x]' if status == 'completed' else '[ ]'
+        line = f"  {i}. {status_icon} {title}"
+        if due:
+            line += f"  (due: {due[:10]})"
+        print(line)
+        if notes:
+            print(f"     Notes: {notes[:80]}")
+        print(f"     ID: {task_id}")
+
+    print(f"\n{len(items)} task(s) found.")
+
+
+def cmd_complete(args, config):
+    """Mark a task as completed."""
+    list_id = get_list_id(config, args.list)
+    print(f"Completing task {args.task_id} on '{args.list}' list...")
+
+    params = json.dumps({'tasklist': list_id, 'task': args.task_id})
+    body = json.dumps({'status': 'completed'})
+
+    gws_args = ['tasks', 'tasks', 'patch', '--params', params, '--json', body]
+
+    if args.dry_run:
+        gws_write(gws_args, auto_confirm=False, dry_run=True)
+        return
+
+    stdout, success = gws_write(gws_args, args.auto_confirm)
+    if not success:
+        return
+
+    # Parse response
+    try:
+        result = json.loads(stdout)
+        title = result.get('title', '(unknown)')
+        completed_at = result.get('completed', datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    except (json.JSONDecodeError, KeyError):
+        title = '(unknown)'
+        completed_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # Update CRM
+    crm_upsert_task(
+        google_task_id=args.task_id,
+        task_list=args.list,
+        title=title,
+        status='completed',
+        completed_at=completed_at,
+    )
+
+    publish_note(f"Task completed: {title} [{args.list}]", args.auto_confirm)
+    print(f"\nDone. Task '{title}' marked as completed.")
+
+
+def cmd_move(args, config):
+    """Move a task between lists.
+
+    Since gws-safe blocks delete, the flow is:
+    1. Read the task from the source list
+    2. Create it on the target list
+    3. Mark the original as completed with a note saying "moved to <list>"
+    4. Update CRM record
+    """
+    from_list_id = get_list_id(config, getattr(args, 'from'))
+    to_list_id = get_list_id(config, args.to)
+    from_name = getattr(args, 'from')
+    to_name = args.to
+
+    print(f"Moving task {args.task_id} from '{from_name}' to '{to_name}'...")
+
+    # Step 1: Read the task from source list
+    params = json.dumps({'tasklist': from_list_id, 'task': args.task_id})
+    stdout, _, _ = run_cmd(
+        [str(GWS_SAFE), 'tasks', 'tasks', 'get', '--params', params]
+    )
+
+    try:
+        source_task = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to read source task", file=sys.stderr)
+        sys.exit(1)
+
+    title = source_task.get('title', '(No title)')
+    notes = source_task.get('notes', '')
+    due = source_task.get('due')
+
+    print(f"  Task: {title}")
+
+    if args.dry_run:
+        print(f"  Dry-run: would create on '{to_name}' and mark completed on '{from_name}'")
+        return
+
+    # Step 2: Create on target list
+    new_task_body = {'title': title}
+    if notes:
+        new_task_body['notes'] = notes
+    if due:
+        new_task_body['due'] = due
+
+    create_params = json.dumps({'tasklist': to_list_id})
+    create_body = json.dumps(new_task_body)
+    create_args = ['tasks', 'tasks', 'insert', '--params', create_params, '--json', create_body]
+
+    stdout, success = gws_write(create_args, args.auto_confirm)
+    if not success:
+        return
+
+    # Parse new task response
+    try:
+        new_task = json.loads(stdout)
+        new_task_id = new_task['id']
+        print(f"  New task ID: {new_task_id}")
+    except (json.JSONDecodeError, KeyError):
+        print("ERROR: could not parse new task from response", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 3: Mark original as completed with move note
+    move_note = f"Moved to {to_name}"
+    patch_params = json.dumps({'tasklist': from_list_id, 'task': args.task_id})
+    patch_body = json.dumps({'status': 'completed', 'notes': move_note})
+    patch_args = ['tasks', 'tasks', 'patch', '--params', patch_params, '--json', patch_body]
+
+    stdout, success = gws_write(patch_args, args.auto_confirm)
+    if not success:
+        print("WARNING: failed to mark original task as completed", file=sys.stderr)
+
+    # Step 4: Update CRM - create new record, update old one
+    crm_upsert_task(
+        google_task_id=new_task_id,
+        task_list=to_name,
+        title=title,
+        notes=notes if notes else None,
+        due_date=due[:10] if due else None,
+        position=new_task.get('position'),
+    )
+
+    # Update old CRM record
+    crm_upsert_task(
+        google_task_id=args.task_id,
+        task_list=from_name,
+        title=title,
+        status='completed',
+        completed_at=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    )
+
+    publish_note(f"Task moved: {title} [{from_name} -> {to_name}]", args.auto_confirm)
+    print(f"\nDone. Task '{title}' moved from {from_name} to {to_name}.")
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Google Tasks management with CRM tracking",
+    )
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # create
+    p_create = subparsers.add_parser('create', help='Create a new task')
+    p_create.add_argument('--list', required=True, choices=LIST_NAMES, help='Task list name')
+    p_create.add_argument('--title', required=True, help='Task title')
+    p_create.add_argument('--notes', help='Task notes')
+    p_create.add_argument('--due', help='Due date (YYYY-MM-DD)')
+    p_create.add_argument('--auto-confirm', action='store_true', help='Auto-confirm writes')
+    p_create.add_argument('--dry-run', action='store_true', help='Show what would happen')
+
+    # list
+    p_list = subparsers.add_parser('list', help='List tasks on a list')
+    p_list.add_argument('--list', required=True, choices=LIST_NAMES, help='Task list name')
+
+    # complete
+    p_complete = subparsers.add_parser('complete', help='Complete a task')
+    p_complete.add_argument('--list', required=True, choices=LIST_NAMES, help='Task list name')
+    p_complete.add_argument('--task-id', required=True, help='Google Task ID')
+    p_complete.add_argument('--auto-confirm', action='store_true', help='Auto-confirm writes')
+    p_complete.add_argument('--dry-run', action='store_true', help='Show what would happen')
+
+    # move
+    p_move = subparsers.add_parser('move', help='Move a task between lists')
+    p_move.add_argument('--task-id', required=True, help='Google Task ID')
+    p_move.add_argument('--from', required=True, choices=LIST_NAMES, help='Source list')
+    p_move.add_argument('--to', required=True, choices=LIST_NAMES, help='Target list')
+    p_move.add_argument('--auto-confirm', action='store_true', help='Auto-confirm writes')
+    p_move.add_argument('--dry-run', action='store_true', help='Show what would happen')
+
+    args = parser.parse_args()
+
+    # Read config
+    config, _ = read_configs()
+
+    if args.command == 'create':
+        cmd_create(args, config)
+    elif args.command == 'list':
+        cmd_list(args, config)
+    elif args.command == 'complete':
+        cmd_complete(args, config)
+    elif args.command == 'move':
+        cmd_move(args, config)
+
+
+if __name__ == '__main__':
+    main()

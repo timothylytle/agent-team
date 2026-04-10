@@ -265,3 +265,34 @@ CREATE TABLE ideas (
 
 CREATE INDEX idx_ideas_status_id ON ideas(status_id) WHERE status_id IS NOT NULL;
 CREATE INDEX idx_ideas_project_id ON ideas(project_id) WHERE project_id IS NOT NULL;
+
+-- ============================================================
+-- Tasks
+-- Google Tasks tracked in the CRM. Each task belongs to a
+-- single task list (in_progress, waiting, backlog). Google
+-- Tasks is the source of truth for task content.
+-- ============================================================
+CREATE TABLE tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_task_id  TEXT UNIQUE NOT NULL,
+    task_list       TEXT NOT NULL CHECK (task_list IN ('in_progress', 'waiting', 'backlog')),
+    title           TEXT NOT NULL,
+    notes           TEXT,
+    status          TEXT NOT NULL DEFAULT 'needsAction' CHECK (status IN ('needsAction', 'completed')),
+    due_date        TEXT,                   -- ISO 8601
+    completed_at    TEXT,                   -- ISO 8601
+    parent_task_id  TEXT,                   -- Google Tasks parent ID for subtasks
+    position        TEXT,                   -- Google Tasks ordering (opaque string)
+    company_id      INTEGER REFERENCES companies(id),
+    ticket_id       INTEGER REFERENCES tickets(id),
+    project_id      INTEGER REFERENCES projects(id),
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX idx_tasks_google_task_id ON tasks(google_task_id);
+CREATE INDEX idx_tasks_task_list ON tasks(task_list);
+CREATE INDEX idx_tasks_status ON tasks(status);
+CREATE INDEX idx_tasks_company_id ON tasks(company_id) WHERE company_id IS NOT NULL;
+CREATE INDEX idx_tasks_ticket_id ON tasks(ticket_id) WHERE ticket_id IS NOT NULL;
+CREATE INDEX idx_tasks_project_id ON tasks(project_id) WHERE project_id IS NOT NULL;

@@ -227,10 +227,14 @@ def should_filter(msg):
 
 def parse_sender(from_header):
     """Parse From header into (name, email).
-    Handles 'Name <email>' and bare 'email' formats."""
-    match = re.match(r'"?([^"<]*)"?\s*<([^>]+)>', from_header)
+    Handles 'Name <email>', '"Name" <email>', and bare 'email' formats."""
+    # Try quoted name first (handles escaped quotes inside)
+    match = re.match(r'"((?:[^"\\]|\\.)*)"\s*<([^>]+)>', from_header)
+    if not match:
+        # Try unquoted name
+        match = re.match(r'([^<]*)<([^>]+)>', from_header)
     if match:
-        name = match.group(1).strip()
+        name = match.group(1).strip().replace('\\"', '"')
         email = match.group(2).strip()
     else:
         email = from_header.strip()

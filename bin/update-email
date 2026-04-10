@@ -573,29 +573,13 @@ def main():
             crm_records.append(record)
 
     # Step 9: Build email summary card
-    vip_count = len(classified["vip"])
-    customer_count = len(classified["customer"])
-    internal_count = len(classified["internal"])
-    unknown_count = len(classified["unknown"])
-    total_count = vip_count + customer_count + internal_count + unknown_count
-
-    # Category breakdown (non-zero only)
-    breakdown_parts = []
-    if vip_count:
-        breakdown_parts.append(f"{vip_count} VIP")
-    if customer_count:
-        breakdown_parts.append(f"{customer_count} customer")
-    if internal_count:
-        breakdown_parts.append(f"{internal_count} internal")
-    if unknown_count:
-        breakdown_parts.append(f"{unknown_count} unknown")
-    category_breakdown = ", ".join(breakdown_parts)
+    total_count = sum(len(v) for v in classified.values())
 
     timestamp = datetime.now().strftime("%-I:%M %p")
 
-    # Build important email list (VIP first, then customer, up to 5)
+    # Build important email list (all categories in priority order, up to 5)
     important_emails = []  # list of (display_text, gmail_url)
-    for cat in ("vip", "customer"):
+    for cat in ("vip", "customer", "internal", "unknown"):
         for (sender_name, subject, line, gmail_url,
              msg_id, sender_email, company_id, contact_id, received_at) in classified[cat]:
             company_name = None
@@ -605,9 +589,9 @@ def main():
                     break
             subj = subject if len(subject) <= 60 else subject[:60] + "..."
             if company_name:
-                display = f"[{company_name} - {sender_name}] {subj}"
+                display = f"{'! ' if cat == 'vip' else ''}{sender_name} at {company_name} — {subj}"
             else:
-                display = f"[{sender_name}] {subj}"
+                display = f"{'! ' if cat == 'vip' else ''}{sender_name} — {subj}"
             important_emails.append((display, gmail_url))
             if len(important_emails) >= 5:
                 break
@@ -615,7 +599,8 @@ def main():
             break
 
     # Build the card text block
-    header_line = f"{timestamp} \u2014 {total_count} emails ({category_breakdown})"
+    email_word = "email" if total_count == 1 else "emails"
+    header_line = f"{timestamp} \u2014 {total_count} new {email_word}"
     card_lines = [header_line]
     for display, _ in important_emails:
         card_lines.append(display)
@@ -649,7 +634,7 @@ def main():
     # Step 13: Update cache
     update_cache(doc_id)
 
-    publish_note(f"Email summary added: {total_count} emails ({category_breakdown}).", auto_confirm)
+    publish_note(f"Email summary added: {total_count} new {email_word}.", auto_confirm)
 
     print("\nDone. Added email summary to Email section.")
 

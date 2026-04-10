@@ -27,7 +27,7 @@ from lib.daily_log_utils import (
     execute_batch_update,
     extract_section_text,
     fetch_doc,
-    find_last_bullet_end_in_section,
+
     get_section,
     publish_note,
     read_configs,
@@ -363,25 +363,17 @@ def parse_existing_timestamps(section_text):
 # --- Build batchUpdate ---
 
 
-def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
-    """Build the batchUpdate JSON for inserting an email summary line.
+def build_batch_update(summary_text, header_line, important_emails, insert_index, style):
+    """Build the batchUpdate JSON for inserting an email summary card.
 
-    When inherit_bullet is True, inserts at last_bullet_end - 1 (before the
-    existing paragraph's trailing newline). The leading \\n splits the existing
-    paragraph and new paragraphs inherit bullet membership, paragraph style,
-    and font styling automatically.
-
-    When inherit_bullet is False (fallback), inserts at section_end with
-    explicit paragraph style, bullet creation, and font styling.
+    Inserts a multi-line block: bold header line + linked email items.
+    Plain NORMAL_TEXT with bold header and Gmail links on email lines.
     """
-    if inherit_bullet:
-        insert_text = "\n" + line_text
-    else:
-        insert_text = line_text + "\n"
+    insert_text = summary_text + "\n"
 
     requests = []
 
-    # 1. Insert text
+    # 1. Insert full text block
     requests.append({
         "insertText": {
             "location": {"index": insert_index},
@@ -389,69 +381,60 @@ def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
         }
     })
 
-    if inherit_bullet:
-        # Clear strikethrough that may be inherited from checked checkboxes
-        text_start = insert_index + utf16_len("\n")
-        text_end = insert_index + utf16_len(insert_text)
-        requests.append({
-            "updateTextStyle": {
-                "range": {"startIndex": text_start, "endIndex": text_end},
-                "textStyle": {"strikethrough": False},
-                "fields": "strikethrough",
-            }
-        })
-    else:
-        # Fallback: explicit paragraph style, bullets, and font styling
-        text_start = insert_index
-        text_end = insert_index + utf16_len(insert_text)
+    text_start = insert_index
+    text_end = insert_index + utf16_len(insert_text)
 
-        # 2. Reset paragraph style to NORMAL_TEXT
-        requests.append({
-            "updateParagraphStyle": {
-                "range": {
-                    "startIndex": text_start,
-                    "endIndex": text_end,
-                },
-                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
-                "fields": "namedStyleType",
-            }
-        })
-
-        # 3. Apply checkbox bullets
-        requests.append({
-            "createParagraphBullets": {
-                "range": {
-                    "startIndex": text_start,
-                    "endIndex": text_end,
-                },
-                "bulletPreset": style["bulletPresets"]["checkbox"],
-            }
-        })
-
-        # 4. Apply font styling
-        text_style = {
-            "weightedFontFamily": {
-                "fontFamily": style["fonts"]["body"],
-            }
+    # 2. NORMAL_TEXT paragraph style
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": text_start, "endIndex": text_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
         }
-        fields = "weightedFontFamily"
+    })
 
-        if style["colors"].get("bodyText"):
-            text_style["foregroundColor"] = {
-                "color": {"rgbColor": style["colors"]["bodyText"]}
-            }
-            fields += ",foregroundColor"
+    # 3. Body font to all text
+    text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        fields += ",foregroundColor"
 
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": text_start, "endIndex": text_end},
+            "textStyle": text_style,
+            "fields": fields,
+        }
+    })
+
+    # 4. Bold the header line
+    header_end = insert_index + utf16_len(header_line)
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": text_start, "endIndex": header_end},
+            "textStyle": {"bold": True},
+            "fields": "bold",
+        }
+    })
+
+    # 5. Gmail links on each email line
+    cursor = insert_index + utf16_len(header_line + "\n")
+    for display_text, gmail_url in important_emails:
+        line_start = cursor
+        line_end = cursor + utf16_len(display_text)
         requests.append({
             "updateTextStyle": {
-                "range": {
-                    "startIndex": text_start,
-                    "endIndex": text_end,
-                },
-                "textStyle": text_style,
-                "fields": fields,
+                "range": {"startIndex": line_start, "endIndex": line_end},
+                "textStyle": {"link": {"url": gmail_url}},
+                "fields": "link",
             }
         })
+        cursor = line_end + utf16_len("\n")
 
     return {"requests": requests}
 
@@ -589,7 +572,7 @@ def main():
                 record["company_id"] = company_id
             crm_records.append(record)
 
-    # Step 9: Build summary line
+    # Step 9: Build email summary card
     vip_count = len(classified["vip"])
     customer_count = len(classified["customer"])
     internal_count = len(classified["internal"])
@@ -608,8 +591,10 @@ def main():
         breakdown_parts.append(f"{unknown_count} unknown")
     category_breakdown = ", ".join(breakdown_parts)
 
-    # Pick top 3-5 suggested subjects (VIP first, then customer)
-    suggested = []
+    timestamp = datetime.now().strftime("%-I:%M %p")
+
+    # Build important email list (VIP first, then customer, up to 5)
+    important_emails = []  # list of (display_text, gmail_url)
     for cat in ("vip", "customer"):
         for (sender_name, subject, line, gmail_url,
              msg_id, sender_email, company_id, contact_id, received_at) in classified[cat]:
@@ -618,22 +603,27 @@ def main():
                 if company_id and c["id"] == company_id:
                     company_name = c["name"]
                     break
-            subj = subject if len(subject) <= 50 else subject[:50] + "..."
+            subj = subject if len(subject) <= 60 else subject[:60] + "..."
             if company_name:
-                suggested.append(f"[{company_name}] {subj}")
+                display = f"[{company_name} - {sender_name}] {subj}"
             else:
-                suggested.append(subj)
-            if len(suggested) >= 5:
+                display = f"[{sender_name}] {subj}"
+            important_emails.append((display, gmail_url))
+            if len(important_emails) >= 5:
                 break
-        if len(suggested) >= 5:
+        if len(important_emails) >= 5:
             break
 
-    timestamp = datetime.now().strftime("%-I:%M %p")
-    summary_line = f"{timestamp} \u2014 {total_count} emails ({category_breakdown})"
-    if suggested:
-        summary_line += f". Suggested: {', '.join(suggested)}"
+    # Build the card text block
+    header_line = f"{timestamp} \u2014 {total_count} emails ({category_breakdown})"
+    card_lines = [header_line]
+    for display, _ in important_emails:
+        card_lines.append(display)
+    summary_text = "\n".join(card_lines)
 
-    print(f"Summary: {summary_line}")
+    print(f"Summary: {header_line}")
+    for display, _ in important_emails:
+        print(f"  {display}")
 
     # Step 10: Check timestamp dedup
     section_text = extract_section_text(doc, section_start, section_end)
@@ -643,16 +633,9 @@ def main():
         print("Already have a summary for this minute")
         sys.exit(0)
 
-    # Step 11: Insert the summary line
-    last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
-    if last_bullet:
-        insert_index = last_bullet - 1
-        inherit_bullet = True
-    else:
-        insert_index = section_end
-        inherit_bullet = False
-
-    batch = build_batch_update(summary_line, insert_index, style, inherit_bullet)
+    # Step 11: Insert the summary card at end of section
+    insert_index = section_end
+    batch = build_batch_update(summary_text, header_line, important_emails, insert_index, style)
     success = execute_batch_update(doc_id, batch, auto_confirm)
 
     if not success:

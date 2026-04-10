@@ -269,13 +269,13 @@ CREATE INDEX idx_ideas_project_id ON ideas(project_id) WHERE project_id IS NOT N
 -- ============================================================
 -- Tasks
 -- Google Tasks tracked in the CRM. Each task belongs to a
--- single task list (in_progress, waiting, backlog). Google
+-- single task list (todo, in_progress, waiting, backlog, done). Google
 -- Tasks is the source of truth for task content.
 -- ============================================================
 CREATE TABLE tasks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     google_task_id  TEXT UNIQUE NOT NULL,
-    task_list       TEXT NOT NULL CHECK (task_list IN ('in_progress', 'waiting', 'backlog')),
+    task_list       TEXT NOT NULL CHECK (task_list IN ('in_progress', 'waiting', 'backlog', 'todo', 'done')),
     title           TEXT NOT NULL,
     notes           TEXT,
     status          TEXT NOT NULL DEFAULT 'needsAction' CHECK (status IN ('needsAction', 'completed')),

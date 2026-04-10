@@ -31,12 +31,14 @@ from lib.daily_log_utils import (
 
 # --- List name to ID mapping ---
 
-LIST_NAMES = ('in_progress', 'waiting', 'backlog')
+LIST_NAMES = ('in_progress', 'waiting', 'backlog', 'todo', 'done')
 
 CONFIG_KEYS = {
     'in_progress': 'inProgressTaskListId',
     'waiting': 'waitingTaskListId',
     'backlog': 'backlogTaskListId',
+    'todo': 'todoTaskListId',
+    'done': 'doneTaskListId',
 }
 
 
@@ -232,7 +234,10 @@ def cmd_list(args, config):
     list_id = get_list_id(config, args.list)
     print(f"Listing tasks on '{args.list}' list...\n")
 
-    params = json.dumps({'tasklist': list_id})
+    params_dict = {'tasklist': list_id, 'showAssigned': True}
+    if not args.show_completed:
+        params_dict['showCompleted'] = False
+    params = json.dumps(params_dict)
     stdout, _, _ = run_cmd(
         [str(GWS_SAFE), 'tasks', 'tasks', 'list', '--params', params]
     )
@@ -428,6 +433,7 @@ def main():
     # list
     p_list = subparsers.add_parser('list', help='List tasks on a list')
     p_list.add_argument('--list', required=True, choices=LIST_NAMES, help='Task list name')
+    p_list.add_argument('--show-completed', action='store_true', help='Include completed tasks')
 
     # complete
     p_complete = subparsers.add_parser('complete', help='Complete a task')

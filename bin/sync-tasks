@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Sync Google Tasks state to CRM database.
+
+Fetches all tasks from all Google Tasks lists and reconciles with the CRM:
+- Creates CRM records for tasks not yet tracked
+- Updates CRM records where status, list, title, or notes have changed
+- Reports a summary of changes
+
+Usage:
+    bin/sync-tasks
+    bin/sync-tasks --dry-run
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Allow imports from bin/lib/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.daily_log_utils import (
+    GWS_SAFE,
+    CRM_SAFE,
+    read_configs,
+    run_cmd,
+)
+
+# List name to config key mapping
+LIST_CONFIG_KEYS = {
+    'in_progress': 'inProgressTaskListId',
+    'waiting': 'waitingTaskListId',
+    'backlog': 'backlogTaskListId',
+    'todo': 'todoTaskListId',
+    'done': 'doneTaskListId',
+}
+
+
+def fetch_tasks_from_list(list_id):
+    """Fetch all tasks from a Google Tasks list (including completed)."""
+    params = json.dumps({'tasklist': list_id, 'showAssigned': True})
+    stdout, _, _ = run_cmd(
+        [str(GWS_SAFE), 'tasks', 'tasks', 'list', '--params', params]
+    )
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("ERROR: failed to parse tasks output", file=sys.stderr)
+        sys.exit(1)
+    return data.get('items', [])
+
+
+def find_crm_task(google_task_id):
+    """Look up a task in CRM by Google Task ID. Returns dict or None."""
+    stdout, stderr, rc = run_cmd(
+        [str(CRM_SAFE), 'tasks', 'find', '--google-task-id', google_task_id],
+        check=False,
+    )
+    if rc != 0:
+        return None
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def create_crm_task(data):
+    """Create a task record in CRM."""
+    stdout, stderr, rc = run_cmd(
+        [str(CRM_SAFE), 'tasks', 'create', '--json', json.dumps(data)],
+        check=False,
+    )
+    if rc != 0:
+        print(f"  WARNING: CRM create failed: {stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def update_crm_task(crm_id, data):
+    """Update a task record in CRM."""
+    stdout, stderr, rc = run_cmd(
+        [str(CRM_SAFE), 'tasks', 'update', str(crm_id), '--json', json.dumps(data)],
+        check=False,
+    )
+    if rc != 0:
+        print(f"  WARNING: CRM update failed: {stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def sync_task(google_task, list_name, dry_run):
+    """Sync a single Google Task to CRM. Returns 'created', 'updated', or 'unchanged'."""
+    google_task_id = google_task.get('id', '')
+    title = google_task.get('title', '').strip()
+    notes = google_task.get('notes', '').strip() or None
+    status = google_task.get('status', 'needsAction')
+    completed_at = google_task.get('completed')
+
+    if not title:
+        return 'unchanged'
+
+    crm_task = find_crm_task(google_task_id)
+
+    if crm_task is None:
+        # Create new CRM record
+        data = {
+            'google_task_id': google_task_id,
+            'task_list': list_name,
+            'title': title,
+            'status': status,
+        }
+        if notes:
+            data['notes'] = notes
+        if completed_at:
+            data['completed_at'] = completed_at
+        due = google_task.get('due')
+        if due:
+            data['due_date'] = due[:10]
+        parent = google_task.get('parent')
+        if parent:
+            data['parent_task_id'] = parent
+        position = google_task.get('position')
+        if position:
+            data['position'] = position
+
+        if dry_run:
+            print(f"  [create] {title} ({list_name})")
+            return 'created'
+
+        if create_crm_task(data):
+            return 'created'
+        return 'unchanged'
+
+    # Compare fields to see if update is needed
+    changed = False
+    update_data = {}
+
+    if crm_task.get('task_list') != list_name:
+        update_data['task_list'] = list_name
+        changed = True
+    if crm_task.get('status') != status:
+        update_data['status'] = status
+        changed = True
+    if crm_task.get('title') != title:
+        update_data['title'] = title
+        changed = True
+    crm_notes = crm_task.get('notes') or None
+    if crm_notes != notes:
+        update_data['notes'] = notes or ''
+        changed = True
+    if completed_at and crm_task.get('completed_at') != completed_at:
+        update_data['completed_at'] = completed_at
+        changed = True
+
+    if not changed:
+        return 'unchanged'
+
+    if dry_run:
+        fields = ', '.join(update_data.keys())
+        print(f"  [update] {title} ({list_name}) — fields: {fields}")
+        return 'updated'
+
+    if update_crm_task(crm_task['id'], update_data):
+        return 'updated'
+    return 'unchanged'
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync Google Tasks to CRM database")
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be synced without writing')
+    args = parser.parse_args()
+
+    dry_run = args.dry_run
+
+    # Read config
+    config, _ = read_configs()
+
+    created = 0
+    updated = 0
+    unchanged = 0
+
+    for list_name, config_key in LIST_CONFIG_KEYS.items():
+        list_id = config.get(config_key)
+        if not list_id:
+            print(f"WARNING: config key '{config_key}' not found, skipping {list_name}", file=sys.stderr)
+            continue
+
+        print(f"Syncing {list_name} list...")
+        tasks = fetch_tasks_from_list(list_id)
+
+        for task in tasks:
+            result = sync_task(task, list_name, dry_run)
+            if result == 'created':
+                created += 1
+            elif result == 'updated':
+                updated += 1
+            else:
+                unchanged += 1
+
+    prefix = "[dry-run] " if dry_run else ""
+    print(f"\n{prefix}Sync complete: {created} created, {updated} updated, {unchanged} unchanged")
+
+
+if __name__ == '__main__':
+    main()

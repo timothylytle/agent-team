@@ -70,6 +70,8 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | KPI | Generates weekly KPI report (Friday-Thursday) with helpdesk metrics, meetings, tasks, and support summary | `.claude/skills/kpi/SKILL.md` |
 | Project | Development Project Manager — creates, researches, and tracks development projects | `.claude/skills/project/SKILL.md` |
 | Tasks | Google Tasks management — creates, lists, completes, and moves tasks across all lists with CRM tracking | `.claude/skills/tasks/SKILL.md` |
+| Backlog | Agent work queue processor — reads backlog tasks, routes to skills/agents, processes in batch | `.claude/skills/backlog/SKILL.md` |
+| Sync Tasks | Syncs Google Tasks state to CRM database | `.claude/skills/sync-tasks/SKILL.md` |
 
 ## Hiring Process
 

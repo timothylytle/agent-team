@@ -1,13 +1,13 @@
 ---
 name: publish-to-notes
-description: Publishes a timestamped message to the Notes section of today's daily log.
+description: Publishes a timestamped message to the Agent Log section of today's daily log.
 ---
 
 You are executing the Publish to Notes skill. This skill delegates to a deterministic Python script.
 
 ## Purpose
 
-Append a timestamped checkbox entry to the Notes section of today's daily log. Used by other skills to log their activity, making the daily log a record of both user and agent actions.
+Append a timestamped bullet entry to the Agent Log section of today's daily log. Used by other skills to log their activity, making the daily log a record of both user and agent actions.
 
 ## Execution
 
@@ -25,8 +25,8 @@ If it exits with a non-zero code, report the error output.
 1. Reads config files (`daily_log.json`, `doc_styles.json`)
 2. Checks the daily-log-cache for today's Notes section boundaries
 3. Fetches the Google Doc
-4. Inserts a timestamped checkbox line: `h:MM AM -- <text>`
-5. Applies body font styling (Roboto) and checkbox bullet formatting
+4. Inserts a timestamped bullet line: `h:MM AM -- <text>`
+5. Applies body font styling (Roboto) and bullet formatting
 6. Updates the daily-log-cache after a successful write
 
 ## Prerequisites

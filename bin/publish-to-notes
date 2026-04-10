@@ -83,14 +83,14 @@ def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
             }
         })
 
-        # 3. Apply checkbox bullets
+        # 3. Apply bullet list
         requests.append({
             "createParagraphBullets": {
                 "range": {
                     "startIndex": text_start,
                     "endIndex": text_end,
                 },
-                "bulletPreset": style["bulletPresets"]["checkbox"],
+                "bulletPreset": style["bulletPresets"]["default"],
             }
         })
 
@@ -125,7 +125,7 @@ def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
 # --- Main ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Add a timestamped note to the Notes section of the daily log")
+    parser = argparse.ArgumentParser(description="Add a timestamped note to the Agent Log section of the daily log")
     parser.add_argument("--text", required=True, help="Note text")
     parser.add_argument("--auto-confirm", action="store_true", help="Automatically confirm the batchUpdate write")
     args = parser.parse_args()
@@ -141,20 +141,20 @@ def main():
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_heading = datetime.now().strftime("%A %b %-d, %Y")
 
-    print(f"Adding note to Notes for {today_heading}")
+    print(f"Adding note to Agent Log for {today_heading}")
     print(f"Document ID: {doc_id}")
 
     # Step 2: Fetch doc and check cache freshness
     doc = fetch_doc(doc_id)
     ensure_cache_fresh(doc, doc_id)
 
-    boundaries = get_section(doc_id, today_str, "notes")
+    boundaries = get_section(doc_id, today_str, "agent_log")
     if not boundaries:
         print("ERROR: No cached entry for today. Run /daily-log first to create the entry.", file=sys.stderr)
         sys.exit(1)
 
     section_start, section_end = boundaries
-    print(f"Notes section: index {section_start} to {section_end}")
+    print(f"Agent Log section: index {section_start} to {section_end}")
 
     # Step 3: Find insertion point
 
@@ -179,7 +179,7 @@ def main():
     # Step 5: Update cache
     update_cache(doc_id)
 
-    print(f"\nDone. Added note to Notes section:")
+    print(f"\nDone. Added note to Agent Log section:")
     print(f"  {line_text}")
 
 

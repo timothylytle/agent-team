@@ -16,40 +16,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.daily_log_utils import (
+    ensure_cache_fresh,
     execute_batch_update,
     extract_section_text,
     fetch_doc,
     find_last_bullet_end_in_section,
-    get_cache_db,
+    get_section,
     publish_note,
     read_configs,
     update_cache,
     utf16_len,
 )
-
-
-# --- Step 2: Check cache for section boundaries ---
-
-def get_section_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's thoughts_ideas section boundaries.
-    Returns (start_index, end_index) or None if not cached."""
-    db = get_cache_db()
-    entry = db.execute(
-        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
-        (doc_id, today_str),
-    ).fetchone()
-    if not entry:
-        db.close()
-        return None
-    section = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'thoughts_ideas'",
-        (entry["id"],),
-    ).fetchone()
-    db.close()
-    if not section:
-        return None
-    return section["start_index"], section["end_index"]
 
 
 # --- Step 5: Build batchUpdate ---
@@ -172,8 +149,11 @@ def main():
     print(f"Adding idea to Thoughts / Ideas for {today_heading}")
     print(f"Document ID: {doc_id}")
 
-    # Step 2: Check cache for section boundaries
-    boundaries = get_section_boundaries(doc_id, today_str)
+    # Step 2: Fetch doc and check cache freshness
+    doc = fetch_doc(doc_id)
+    ensure_cache_fresh(doc, doc_id)
+
+    boundaries = get_section(doc_id, today_str, "thoughts_ideas")
     if not boundaries:
         print("ERROR: No cached entry for today. Run /daily-log first to create the entry.", file=sys.stderr)
         sys.exit(1)
@@ -181,8 +161,7 @@ def main():
     section_start, section_end = boundaries
     print(f"Thoughts / Ideas section: index {section_start} to {section_end}")
 
-    # Step 3: Fetch doc and extract current section text
-    doc = fetch_doc(doc_id)
+    # Step 3: Extract current section text
     section_text = extract_section_text(doc, section_start, section_end)
     print(f"Current section text: {repr(section_text[:100])}...")
 

@@ -21,9 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.daily_log_utils import (
     FRESHDESK_SAFE,
     GWS_SAFE,
+    ensure_cache_fresh,
     execute_batch_update,
     fetch_doc,
-    get_cache_db,
+    get_section,
     publish_note,
     read_configs,
     run_cmd,
@@ -55,31 +56,6 @@ def compute_week_range(week_ending_str=None):
 
     week_start = week_end - timedelta(days=6)
     return week_start, week_end
-
-
-# --- Notes section boundaries ---
-
-
-def get_notes_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's notes section boundaries.
-    Returns (start_index, end_index) or None if not cached."""
-    db = get_cache_db()
-    entry = db.execute(
-        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
-        (doc_id, today_str),
-    ).fetchone()
-    if not entry:
-        db.close()
-        return None
-    section = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'notes'",
-        (entry["id"],),
-    ).fetchone()
-    db.close()
-    if not section:
-        return None
-    return section["start_index"], section["end_index"]
 
 
 # --- Data collection ---
@@ -646,7 +622,10 @@ def main():
     doc_id = config["documentId"]
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    boundaries = get_notes_boundaries(doc_id, today_str)
+    doc = fetch_doc(doc_id)
+    ensure_cache_fresh(doc, doc_id)
+
+    boundaries = get_section(doc_id, today_str, "notes")
     if not boundaries:
         print(
             "ERROR: No cached entry for today. Run /daily-log first to create the entry.",

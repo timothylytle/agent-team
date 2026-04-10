@@ -23,10 +23,12 @@ from lib.daily_log_utils import (
     CRM_DB_PATH,
     CRM_SAFE,
     GWS_SAFE,
+    ensure_cache_fresh,
     execute_batch_update,
     extract_section_text,
+    fetch_doc,
     find_last_bullet_end_in_section,
-    get_cache_db,
+    get_section,
     publish_note,
     read_configs,
     run_cmd,
@@ -43,53 +45,6 @@ CATEGORY_LABELS_TO_FILTER = {
 }
 
 NOREPLY_RE = re.compile(r"^no.?reply@", re.IGNORECASE)
-
-
-# --- Section boundaries ---
-
-
-def get_section_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's email section boundaries.
-    Returns (start_index, end_index) or None if not cached."""
-    db = get_cache_db()
-    entry = db.execute(
-        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
-        (doc_id, today_str),
-    ).fetchone()
-    if not entry:
-        db.close()
-        return None
-    section = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'email'",
-        (entry["id"],),
-    ).fetchone()
-    db.close()
-    if not section:
-        return None
-    return section["start_index"], section["end_index"]
-
-
-def _get_section_boundaries_by_type(doc_id, today_str, section_type):
-    """Query the daily-log-cache for a specific section type's boundaries.
-    Returns (start_index, end_index) or None."""
-    db = get_cache_db()
-    entry = db.execute(
-        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
-        (doc_id, today_str),
-    ).fetchone()
-    if not entry:
-        db.close()
-        return None
-    section = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = ?",
-        (entry["id"], section_type),
-    ).fetchone()
-    db.close()
-    if not section:
-        return None
-    return section["start_index"], section["end_index"]
 
 
 def _insert_email_section(doc_id, insert_index, style, auto_confirm):
@@ -408,9 +363,6 @@ def parse_existing_timestamps(section_text):
 # --- Build batchUpdate ---
 
 
-from lib.daily_log_utils import fetch_doc  # noqa: E402
-
-
 def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
     """Build the batchUpdate JSON for inserting an email summary line.
 
@@ -523,11 +475,14 @@ def main():
     print(f"Updating Email for {today_heading}")
     print(f"Document ID: {doc_id}")
 
-    # Step 2: Check cache for section boundaries
-    boundaries = get_section_boundaries(doc_id, today_str)
+    # Step 2: Fetch doc and check cache freshness
+    doc = fetch_doc(doc_id)
+    ensure_cache_fresh(doc, doc_id)
+
+    boundaries = get_section(doc_id, today_str, "email")
     if not boundaries:
         # Check if the entry exists but is missing the Email section
-        thoughts_boundaries = _get_section_boundaries_by_type(doc_id, today_str, "thoughts_ideas")
+        thoughts_boundaries = get_section(doc_id, today_str, "thoughts_ideas")
         if not thoughts_boundaries:
             print("ERROR: No cached entry for today. Run /daily-log first to create the entry.",
                   file=sys.stderr)
@@ -538,8 +493,11 @@ def main():
         _insert_email_section(doc_id, thoughts_boundaries[0], style, auto_confirm)
         update_cache(doc_id)
 
+        # Doc was modified, re-fetch for accurate indices
+        doc = fetch_doc(doc_id)
+
         # Re-fetch boundaries after insertion
-        boundaries = get_section_boundaries(doc_id, today_str)
+        boundaries = get_section(doc_id, today_str, "email")
         if not boundaries:
             print("ERROR: Failed to find Email section after insertion.", file=sys.stderr)
             sys.exit(1)
@@ -678,7 +636,6 @@ def main():
     print(f"Summary: {summary_line}")
 
     # Step 10: Check timestamp dedup
-    doc = fetch_doc(doc_id)
     section_text = extract_section_text(doc, section_start, section_end)
     existing_timestamps = parse_existing_timestamps(section_text)
 

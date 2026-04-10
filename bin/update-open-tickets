@@ -20,45 +20,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.daily_log_utils import (
     FRESHDESK_TICKET_URL,
+    ensure_cache_fresh,
     execute_batch_update,
     extract_section_text,
+    fetch_doc,
     fetch_open_tickets,
     find_last_bullet_end_in_section,
-    get_cache_db,
+    get_section,
     publish_note,
     read_configs,
     update_cache,
     utf16_len,
 )
-
-
-# --- Step 2: Check cache for section boundaries ---
-
-def get_section_boundaries(doc_id, today_str):
-    """Query the daily-log-cache for today's open_tickets section boundaries.
-    Returns (start_index, end_index) or None if not cached."""
-    db = get_cache_db()
-    entry = db.execute(
-        "SELECT id FROM entries WHERE document_id = ? AND entry_date = ?",
-        (doc_id, today_str),
-    ).fetchone()
-    if not entry:
-        db.close()
-        return None
-    section = db.execute(
-        "SELECT start_index, end_index FROM sections "
-        "WHERE entry_id = ? AND section_type = 'open_tickets'",
-        (entry["id"],),
-    ).fetchone()
-    db.close()
-    if not section:
-        return None
-    return section["start_index"], section["end_index"]
-
-
-# fetch_open_tickets, fetch_doc (as fetch_doc_section), and extract_section_text
-# are imported from lib.daily_log_utils
-from lib.daily_log_utils import fetch_doc  # noqa: E402
 
 
 def parse_existing_ticket_ids(section_text):
@@ -197,8 +170,11 @@ def main():
     print(f"Updating Open Tickets for {today_heading}")
     print(f"Document ID: {doc_id}")
 
-    # Step 2: Check cache for section boundaries
-    boundaries = get_section_boundaries(doc_id, today_str)
+    # Step 2: Fetch doc and check cache freshness
+    doc = fetch_doc(doc_id)
+    ensure_cache_fresh(doc, doc_id)
+
+    boundaries = get_section(doc_id, today_str, "open_tickets")
     if not boundaries:
         print("ERROR: No cached entry for today. Run /daily-log first to create the entry.", file=sys.stderr)
         sys.exit(1)
@@ -210,8 +186,7 @@ def main():
     tickets = fetch_open_tickets()
     print(f"Found {len(tickets)} open ticket(s) in FreshDesk")
 
-    # Step 4: Fetch doc and extract current section text
-    doc = fetch_doc(doc_id)
+    # Step 4: Extract current section text from doc
     section_text = extract_section_text(doc, section_start, section_end)
 
     # Step 5: Parse existing ticket IDs and compute diff

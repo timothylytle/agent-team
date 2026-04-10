@@ -148,11 +148,14 @@ def crm_upsert_task(google_task_id, task_list, title, notes=None, status='needsA
         except (json.JSONDecodeError, KeyError):
             print("ERROR: failed to parse existing task from CRM", file=sys.stderr)
             sys.exit(1)
-        run_cmd(
+        _, stderr_upd, rc_upd = run_cmd(
             [str(CRM_SAFE), 'tasks', 'update', str(task_id), '--json', json.dumps(data)],
             check=False,
         )
-        print(f"CRM task {task_id} updated.")
+        if rc_upd == 0:
+            print(f"CRM task {task_id} updated.")
+        else:
+            print(f"WARNING: CRM task {task_id} update failed: {stderr_upd}", file=sys.stderr)
     else:
         # Task doesn't exist, create it
         stdout2, stderr2, rc2 = run_cmd(
@@ -313,10 +316,15 @@ def cmd_move(args, config):
     3. Mark the original as completed with a note saying "moved to <list>"
     4. Update CRM record
     """
-    from_list_id = get_list_id(config, getattr(args, 'from'))
-    to_list_id = get_list_id(config, args.to)
     from_name = getattr(args, 'from')
     to_name = args.to
+
+    if from_name == to_name:
+        print("ERROR: source and target lists must be different", file=sys.stderr)
+        sys.exit(1)
+
+    from_list_id = get_list_id(config, from_name)
+    to_list_id = get_list_id(config, to_name)
 
     print(f"Moving task {args.task_id} from '{from_name}' to '{to_name}'...")
 
@@ -367,7 +375,8 @@ def cmd_move(args, config):
         sys.exit(1)
 
     # Step 3: Mark original as completed with move note
-    move_note = f"Moved to {to_name}"
+    existing_notes = source_task.get('notes', '') or ''
+    move_note = f"{existing_notes}\n\nMoved to {to_name}".strip()
     patch_params = json.dumps({'tasklist': from_list_id, 'task': args.task_id})
     patch_body = json.dumps({'status': 'completed', 'notes': move_note})
     patch_args = ['tasks', 'tasks', 'patch', '--params', patch_params, '--json', patch_body]

@@ -259,28 +259,31 @@ def fetch_tickets_assigned():
 def format_report(week_start, week_end, tickets_opened, responses,
                   email_requests, color_counts, meetings, completed_tasks,
                   upcoming_tasks, tickets_assigned, tickets_resolved):
-    """Build the report text.
+    """Build the report data.
 
-    Returns (heading, body) where heading is the HEADING_3 title line
-    and body is the NORMAL_TEXT content.
+    Returns (heading, table_data, body_text) where:
+    - heading is the HEADING_3 title line
+    - table_data is a list of (label, value) tuples for the helpdesk table
+    - body_text is the remaining NORMAL_TEXT content (Meetings, Tasks, Summary)
     """
     start_label = week_start.strftime("%b %-d")
     end_label = week_end.strftime("%b %-d")
     heading = f"KPI \u2014 Week of {start_label}\u2013{end_label}"
 
-    lines = []
     # Support Calls = support + afterhours + onboarding combined
     support_calls = color_counts["4"] + color_counts["11"] + color_counts["1"]
 
-    lines.append("Helpdesk Metrics:")
-    lines.append(f"  Opened Tickets: {tickets_opened}")
-    lines.append(f"  Responses to Customers: {responses}")
-    lines.append(f"  Email Requests: {email_requests}")
-    lines.append(f"  Support Calls with Customers: {support_calls}")
-    lines.append(f"  After Hours Support: {color_counts['11']}")
-    lines.append(f"  Sales Calls (Expert Engineer): {color_counts['6']}")
+    table_data = [
+        ("Metric", "Count"),  # header
+        ("Number of Opened Helpdesk Tickets this week", str(tickets_opened)),
+        ("HelpDesk Responses to Customers", str(responses)),
+        ("Number of Received Email Requests from Customers", str(email_requests)),
+        ("Number of Support Calls with Customers", str(support_calls)),
+        ("Number of After Hours Support", str(color_counts["11"])),
+        ("Number of Sales Calls with Expert Engineer", str(color_counts["6"])),
+    ]
 
-    lines.append("")
+    lines = []
     lines.append("Meetings:")
     if meetings:
         for label, summary in meetings:
@@ -310,35 +313,33 @@ def format_report(week_start, week_end, tickets_opened, responses,
     lines.append(f"  Tickets Resolved: {tickets_resolved}")
     lines.append(f"  Responses to Customers: {responses}")
 
-    body = "\n".join(lines)
-    return heading, body
+    body_text = "\n".join(lines)
+    return heading, table_data, body_text
 
 
 # --- Doc insertion ---
 
 
-def build_kpi_batch_update(heading, body, insert_index, style):
-    """Build the batchUpdate JSON for inserting the KPI report.
+def insert_kpi_heading_and_table(doc_id, heading, insert_index, style, auto_confirm):
+    """Step 1: Insert the HEADING_3 title and an empty 7x2 table.
 
-    Inserts HEADING_3 title + NORMAL_TEXT body at the given index.
+    Returns True if the batchUpdate succeeded, False otherwise.
     """
     heading_text = heading + "\n"
-    body_text = body + "\n"
-    full_text = heading_text + body_text
+    heading_start = insert_index
+    heading_end = insert_index + utf16_len(heading_text)
 
     requests = []
 
-    # 1. Insert the full text block
+    # 1. Insert heading text
     requests.append({
         "insertText": {
             "location": {"index": insert_index},
-            "text": full_text,
+            "text": heading_text,
         }
     })
 
-    # 2. Apply HEADING_3 style to the heading line
-    heading_start = insert_index
-    heading_end = insert_index + utf16_len(heading_text)
+    # 2. Apply HEADING_3 paragraph style
     requests.append({
         "updateParagraphStyle": {
             "range": {"startIndex": heading_start, "endIndex": heading_end},
@@ -347,18 +348,7 @@ def build_kpi_batch_update(heading, body, insert_index, style):
         }
     })
 
-    # 3. Apply NORMAL_TEXT style to the body
-    body_start = heading_end
-    body_end = insert_index + utf16_len(full_text)
-    requests.append({
-        "updateParagraphStyle": {
-            "range": {"startIndex": body_start, "endIndex": body_end},
-            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
-            "fields": "namedStyleType",
-        }
-    })
-
-    # 4. Apply heading font styling
+    # 3. Apply heading font styling
     heading_text_style = {
         "weightedFontFamily": {"fontFamily": style["fonts"]["heading"]}
     }
@@ -377,9 +367,160 @@ def build_kpi_batch_update(heading, body, insert_index, style):
         }
     })
 
-    # 5. Apply body font styling
+    # 4. Insert empty table (7 rows, 2 columns) right after the heading
+    requests.append({
+        "insertTable": {
+            "location": {"index": heading_end},
+            "rows": 7,
+            "columns": 2,
+        }
+    })
+
+    batch = {"requests": requests}
+    return execute_batch_update(doc_id, batch, auto_confirm)
+
+
+def populate_table_and_body(doc_id, table_data, body_text, style, auto_confirm):
+    """Step 2: Populate table cells, style them, and add remaining body text.
+
+    Reads the doc to find real table indices, then builds a batchUpdate
+    to fill cells (reverse order), style them, and append body text.
+
+    Returns True if the batchUpdate succeeded, False otherwise.
+    """
+    doc = fetch_doc(doc_id)
+    body_content = doc["body"]["content"]
+
+    # Find the table element (last table in the doc, since we just inserted it)
+    table_element = None
+    for element in reversed(body_content):
+        if "table" in element:
+            table_element = element
+            break
+
+    if not table_element:
+        print("ERROR: could not find inserted table in document", file=sys.stderr)
+        sys.exit(1)
+
+    table = table_element["table"]
+    table_end = table_element["endIndex"]
+
+    # Collect cell insertion points: (row_idx, col_idx, startIndex)
+    cell_indices = []
+    for row_idx, row in enumerate(table["tableRows"]):
+        for col_idx, cell in enumerate(row["tableCells"]):
+            cell_start = cell["content"][0]["paragraph"]["elements"][0]["startIndex"]
+            cell_indices.append((row_idx, col_idx, cell_start))
+
+    requests = []
+
+    # Insert cell text in reverse order (bottom-right to top-left)
+    for row_idx, col_idx, cell_start in reversed(cell_indices):
+        text = table_data[row_idx][col_idx]
+        requests.append({
+            "insertText": {
+                "location": {"index": cell_start},
+                "text": text,
+            }
+        })
+
+    # After text insertion, indices shift. Re-read doc for styling.
+    # Instead, calculate the shifts and apply styles in the same batch.
+    # Since we insert in reverse order, earlier indices are not affected.
+    # We can compute final ranges by accumulating shifts forward.
+
+    # Build a shift map: for each cell, how much text was inserted before it
+    # Since we insert in reverse order within the same batch, all inserts
+    # happen at their original indices. The Docs API processes requests
+    # sequentially, so earlier inserts shift later indices.
+    # We inserted in reverse order, so the first request inserts at the
+    # highest index (bottom-right), which doesn't affect lower indices.
+    # This means each cell's text lands at its original startIndex.
+
+    # Calculate styled ranges after all inserts
+    # Process cells in forward order to accumulate shifts
+    cumulative_shift = 0
+    styled_ranges = []
+    for row_idx, col_idx, cell_start in cell_indices:
+        text = table_data[row_idx][col_idx]
+        text_len = utf16_len(text)
+        actual_start = cell_start + cumulative_shift
+        actual_end = actual_start + text_len
+        styled_ranges.append((row_idx, col_idx, actual_start, actual_end))
+        cumulative_shift += text_len
+
+    # Apply bold to header row (row 0)
+    for row_idx, col_idx, start, end in styled_ranges:
+        if row_idx == 0:
+            requests.append({
+                "updateTextStyle": {
+                    "range": {"startIndex": start, "endIndex": end},
+                    "textStyle": {"bold": True},
+                    "fields": "bold",
+                }
+            })
+
+    # Apply Roboto font to all cells
+    body_font = style["fonts"]["body"]
+    for row_idx, col_idx, start, end in styled_ranges:
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": start, "endIndex": end},
+                "textStyle": {
+                    "weightedFontFamily": {"fontFamily": body_font}
+                },
+                "fields": "weightedFontFamily",
+            }
+        })
+
+    # Set column widths
+    requests.append({
+        "updateTableColumnProperties": {
+            "tableStartLocation": {"index": table_element["startIndex"]},
+            "columnIndices": [0],
+            "tableColumnProperties": {
+                "widthType": "FIXED_WIDTH",
+                "width": {"magnitude": 350, "unit": "PT"},
+            },
+            "fields": "widthType,width",
+        }
+    })
+    requests.append({
+        "updateTableColumnProperties": {
+            "tableStartLocation": {"index": table_element["startIndex"]},
+            "columnIndices": [1],
+            "tableColumnProperties": {
+                "widthType": "FIXED_WIDTH",
+                "width": {"magnitude": 50, "unit": "PT"},
+            },
+            "fields": "widthType,width",
+        }
+    })
+
+    # Insert remaining body text after the table
+    body_insert_text = body_text + "\n"
+    adjusted_table_end = table_end + cumulative_shift
+    requests.append({
+        "insertText": {
+            "location": {"index": adjusted_table_end},
+            "text": body_insert_text,
+        }
+    })
+
+    # Apply NORMAL_TEXT style to body text
+    body_text_start = adjusted_table_end
+    body_text_end = adjusted_table_end + utf16_len(body_insert_text)
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": body_text_start, "endIndex": body_text_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # Apply body font to body text
     body_text_style = {
-        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+        "weightedFontFamily": {"fontFamily": body_font}
     }
     body_fields = "weightedFontFamily"
     if style["colors"].get("bodyText"):
@@ -390,13 +531,14 @@ def build_kpi_batch_update(heading, body, insert_index, style):
 
     requests.append({
         "updateTextStyle": {
-            "range": {"startIndex": body_start, "endIndex": body_end},
+            "range": {"startIndex": body_text_start, "endIndex": body_text_end},
             "textStyle": body_text_style,
             "fields": body_fields,
         }
     })
 
-    return {"requests": requests}
+    batch = {"requests": requests}
+    return execute_batch_update(doc_id, batch, auto_confirm)
 
 
 # --- Main ---
@@ -460,7 +602,7 @@ def main():
         print(f"  Tickets resolved: {tickets_resolved}")
 
     # Step 3: Format report
-    heading, body = format_report(
+    heading, table_data, body_text = format_report(
         week_start, week_end, tickets_opened, responses, email_requests,
         color_counts, meetings, completed_tasks, upcoming_tasks,
         tickets_assigned, tickets_resolved,
@@ -469,7 +611,11 @@ def main():
     print()
     print("=" * 60)
     print(heading)
-    print(body)
+    print()
+    for label, value in table_data:
+        print(f"  {label}: {value}")
+    print()
+    print(body_text)
     print("=" * 60)
     print()
 
@@ -477,7 +623,7 @@ def main():
         print("Dry-run mode: report not inserted into daily log.")
         return
 
-    # Step 4: Insert into daily log
+    # Step 4: Insert into daily log (two-step batchUpdate)
     doc_id = config["documentId"]
     today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -496,9 +642,19 @@ def main():
     insert_index = section_end
     print(f"Insert index: {insert_index}")
 
-    batch = build_kpi_batch_update(heading, body, insert_index, style)
-    success = execute_batch_update(doc_id, batch, args.auto_confirm)
+    # Step 4a: Insert heading and empty table
+    print("\nStep 1: Inserting heading and table...")
+    success = insert_kpi_heading_and_table(
+        doc_id, heading, insert_index, style, args.auto_confirm,
+    )
+    if not success:
+        sys.exit(2)
 
+    # Step 4b: Populate table cells and add body text
+    print("\nStep 2: Populating table and adding body text...")
+    success = populate_table_and_body(
+        doc_id, table_data, body_text, style, args.auto_confirm,
+    )
     if not success:
         sys.exit(2)
 

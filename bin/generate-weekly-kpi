@@ -460,16 +460,29 @@ def populate_table_and_body(doc_id, table_data, body_text, style, auto_confirm):
                 }
             })
 
-    # Apply Roboto font to all cells
+    # Apply NORMAL_TEXT paragraph style to all table cells so they don't
+    # inherit HEADING_3 sizing from the preceding heading
+    for row_idx, col_idx, start, end in styled_ranges:
+        # Range must cover the paragraph including its trailing newline
+        requests.append({
+            "updateParagraphStyle": {
+                "range": {"startIndex": start, "endIndex": end + 1},
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType",
+            }
+        })
+
+    # Apply Roboto font + explicit 11pt size to all cells
     body_font = style["fonts"]["body"]
     for row_idx, col_idx, start, end in styled_ranges:
         requests.append({
             "updateTextStyle": {
                 "range": {"startIndex": start, "endIndex": end},
                 "textStyle": {
-                    "weightedFontFamily": {"fontFamily": body_font}
+                    "weightedFontFamily": {"fontFamily": body_font},
+                    "fontSize": {"magnitude": 11, "unit": "PT"},
                 },
-                "fields": "weightedFontFamily",
+                "fields": "weightedFontFamily,fontSize",
             }
         })
 

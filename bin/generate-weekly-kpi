@@ -380,21 +380,27 @@ def insert_kpi_heading_and_table(doc_id, heading, insert_index, style, auto_conf
     return execute_batch_update(doc_id, batch, auto_confirm)
 
 
-def populate_table_and_body(doc_id, table_data, body_text, style, auto_confirm):
+def populate_table_and_body(doc_id, table_data, body_text, style, auto_confirm,
+                            expected_table_after):
     """Step 2: Populate table cells, style them, and add remaining body text.
 
     Reads the doc to find real table indices, then builds a batchUpdate
     to fill cells (reverse order), style them, and append body text.
+
+    Args:
+        expected_table_after: the index where the heading was inserted.
+            Used to find the correct table (the one right after our heading).
 
     Returns True if the batchUpdate succeeded, False otherwise.
     """
     doc = fetch_doc(doc_id)
     body_content = doc["body"]["content"]
 
-    # Find the table element (last table in the doc, since we just inserted it)
+    # Find the table element nearest to (and after) our heading insertion point.
+    # We can't just use "last table" because old KPI tables may exist in the doc.
     table_element = None
-    for element in reversed(body_content):
-        if "table" in element:
+    for element in body_content:
+        if "table" in element and element["startIndex"] >= expected_table_after:
             table_element = element
             break
 
@@ -667,6 +673,7 @@ def main():
     print("\nStep 2: Populating table and adding body text...")
     success = populate_table_and_body(
         doc_id, table_data, body_text, style, args.auto_confirm,
+        expected_table_after=insert_index,
     )
     if not success:
         sys.exit(2)

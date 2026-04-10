@@ -126,12 +126,12 @@ def run_ideas(title_rest, notes, dry_run):
 
 
 def run_tasks(title_rest, notes, dry_run):
-    """Run the tasks handler. Creates a task on the in_progress list. Returns True on success."""
+    """Run the tasks handler. Creates a task on the todo list. Returns True on success."""
     task_title = title_rest or "Untitled task"
 
     cmd = [
         str(MANAGE_TASKS), 'create',
-        '--list', 'in_progress',
+        '--list', 'todo',
         '--title', task_title,
         '--auto-confirm',
     ]
@@ -155,10 +155,10 @@ def run_tasks(title_rest, notes, dry_run):
 
 
 def create_followup(original_title, reason, dry_run):
-    """Create a follow-up task on the in_progress list. Returns True on success."""
+    """Create a follow-up task on the todo list. Returns True on success."""
     cmd = [
         str(MANAGE_TASKS), 'create',
-        '--list', 'in_progress',
+        '--list', 'todo',
         '--title', f"Review: {original_title}",
         '--notes', reason,
         '--auto-confirm',

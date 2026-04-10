@@ -275,7 +275,7 @@ CREATE INDEX idx_ideas_project_id ON ideas(project_id) WHERE project_id IS NOT N
 CREATE TABLE tasks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     google_task_id  TEXT UNIQUE NOT NULL,
-    task_list       TEXT NOT NULL CHECK (task_list IN ('in_progress', 'waiting', 'backlog')),
+    task_list       TEXT NOT NULL CHECK (task_list IN ('in_progress', 'waiting', 'backlog', 'todo')),
     title           TEXT NOT NULL,
     notes           TEXT,
     status          TEXT NOT NULL DEFAULT 'needsAction' CHECK (status IN ('needsAction', 'completed')),

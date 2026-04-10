@@ -32,9 +32,11 @@ bin/manage-tasks move --task-id "TASK_ID" --from backlog --to in_progress --auto
 ```
 
 ## Valid list names
+- `todo` — tasks to do
 - `in_progress` — tasks currently being worked on
 - `waiting` — tasks waiting on something
 - `backlog` — tasks queued for future processing
+- `done` — completed tasks
 
 ## After execution
 

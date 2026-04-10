@@ -3,11 +3,15 @@
 
 Adds an entry to the Thoughts / Ideas section of today's daily log.
 
-Usage:
+Usage (card format):
+    bin/update-ideas-log --json '{"title":"...","pros":["..."],"cons":["..."],"recommendation":"..."}' [--auto-confirm]
+
+Usage (legacy bullet format):
     bin/update-ideas-log --title "Idea title" --analysis "Brief analysis" [--source-url "https://..."] [--auto-confirm]
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -124,21 +128,122 @@ def build_batch_update(line_text, insert_index, style, inherit_bullet=False):
     return {"requests": requests}
 
 
+def build_batch_update_card(idea_data, insert_index, style):
+    """Build the batchUpdate JSON for inserting an idea card.
+
+    Card format (plain text, no bullets):
+        Idea Title          (bold, optionally linked)
+        + Pro one
+        + Pro two
+        - Con one
+        - Con two
+        Recommendation: Brief recommendation text
+    """
+    lines = [idea_data["title"]]
+    for pro in idea_data.get("pros", []):
+        lines.append(f"+ {pro}")
+    for con in idea_data.get("cons", []):
+        lines.append(f"- {con}")
+    if idea_data.get("recommendation"):
+        lines.append(f"Recommendation: {idea_data['recommendation']}")
+
+    card_text = "\n".join(lines)
+    insert_text = card_text + "\n"
+
+    requests = []
+
+    # 1. Insert full text block
+    requests.append({
+        "insertText": {
+            "location": {"index": insert_index},
+            "text": insert_text,
+        }
+    })
+
+    text_start = insert_index
+    text_end = insert_index + utf16_len(insert_text)
+
+    # 2. NORMAL_TEXT paragraph style
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {"startIndex": text_start, "endIndex": text_end},
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "fields": "namedStyleType",
+        }
+    })
+
+    # 3. Body font to all text
+    text_style = {
+        "weightedFontFamily": {"fontFamily": style["fonts"]["body"]}
+    }
+    fields = "weightedFontFamily"
+    if style["colors"].get("bodyText"):
+        text_style["foregroundColor"] = {
+            "color": {"rgbColor": style["colors"]["bodyText"]}
+        }
+        fields += ",foregroundColor"
+
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": text_start, "endIndex": text_end},
+            "textStyle": text_style,
+            "fields": fields,
+        }
+    })
+
+    # 4. Bold the title line
+    title_end = insert_index + utf16_len(idea_data["title"])
+    requests.append({
+        "updateTextStyle": {
+            "range": {"startIndex": text_start, "endIndex": title_end},
+            "textStyle": {"bold": True},
+            "fields": "bold",
+        }
+    })
+
+    # 5. Link on title if source_url provided
+    if idea_data.get("source_url"):
+        requests.append({
+            "updateTextStyle": {
+                "range": {"startIndex": text_start, "endIndex": title_end},
+                "textStyle": {"link": {"url": idea_data["source_url"]}},
+                "fields": "link",
+            }
+        })
+
+    return {"requests": requests}
+
+
 # --- Main ---
 
 def main():
     parser = argparse.ArgumentParser(description="Add an entry to the Thoughts / Ideas section of the daily log")
-    parser.add_argument("--title", required=True, help="Idea title")
-    parser.add_argument("--analysis", required=True, help="Brief analysis text")
-    parser.add_argument("--source-url", help="Optional source URL")
+    parser.add_argument("--json", dest="json_data", help="JSON object with title, pros, cons, recommendation, source_url")
+    parser.add_argument("--title", help="Idea title (legacy format)")
+    parser.add_argument("--analysis", help="Brief analysis text (legacy format)")
+    parser.add_argument("--source-url", help="Optional source URL (legacy format)")
     parser.add_argument("--auto-confirm", action="store_true", help="Automatically confirm the batchUpdate write")
+    parser.add_argument("--dry-run", action="store_true", help="Print batchUpdate payload without executing")
     args = parser.parse_args()
     auto_confirm = args.auto_confirm
 
-    # Build the line text
-    line_text = f"{args.title} \u2014 {args.analysis}"
-    if args.source_url:
-        line_text += f" \u2014 {args.source_url}"
+    # Determine mode: card (--json) or legacy (--title/--analysis)
+    use_card = False
+    if args.json_data:
+        use_card = True
+        idea_data = json.loads(args.json_data)
+        if "title" not in idea_data:
+            print("ERROR: --json must include 'title'", file=sys.stderr)
+            sys.exit(1)
+        idea_title = idea_data["title"]
+    elif args.title and args.analysis:
+        idea_title = args.title
+        line_text = f"{args.title} \u2014 {args.analysis}"
+        if args.source_url:
+            line_text += f" \u2014 {args.source_url}"
+    else:
+        print("ERROR: must provide --json or both --title and --analysis", file=sys.stderr)
+        sys.exit(1)
 
     # Step 1: Read configs
     config, style = read_configs()
@@ -166,18 +271,28 @@ def main():
     print(f"Current section text: {repr(section_text[:100])}...")
 
     # Step 4: Build and execute batchUpdate
-    last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
-    if last_bullet:
-        insert_index = last_bullet - 1  # before the trailing \n
-        inherit_bullet = True
+    if use_card:
+        insert_index = section_end
+        print(f"Insert index: {insert_index} (card format)")
+        batch = build_batch_update_card(idea_data, insert_index, style)
     else:
-        insert_index = section_end  # fallback: no existing bullets
-        inherit_bullet = False
+        last_bullet = find_last_bullet_end_in_section(doc, section_start, section_end)
+        if last_bullet:
+            insert_index = last_bullet - 1  # before the trailing \n
+            inherit_bullet = True
+        else:
+            insert_index = section_end  # fallback: no existing bullets
+            inherit_bullet = False
 
-    print(f"Insert index: {insert_index} (inherit_bullet={inherit_bullet})")
-    print(f"Line: {line_text}")
+        print(f"Insert index: {insert_index} (inherit_bullet={inherit_bullet})")
+        print(f"Line: {line_text}")
+        batch = build_batch_update(line_text, insert_index, style, inherit_bullet)
 
-    batch = build_batch_update(line_text, insert_index, style, inherit_bullet)
+    if args.dry_run:
+        print("\n[dry-run] batchUpdate payload:")
+        print(json.dumps(batch, indent=2))
+        return
+
     success = execute_batch_update(doc_id, batch, auto_confirm)
 
     if not success:
@@ -186,10 +301,10 @@ def main():
     # Step 5: Update cache
     update_cache(doc_id)
 
-    publish_note(f"Idea added: {args.title}", auto_confirm)
+    publish_note(f"Idea added: {idea_title}", auto_confirm)
 
     print(f"\nDone. Added idea to Thoughts / Ideas section:")
-    print(f"  {line_text}")
+    print(f"  {idea_title}")
 
 
 if __name__ == "__main__":

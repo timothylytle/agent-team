@@ -97,34 +97,6 @@ def run_skill(skill_name, dry_run):
     return True
 
 
-def run_ideas(title_rest, notes, dry_run):
-    """Run the ideas handler. Returns True on success."""
-    idea_title = title_rest or "Untitled idea"
-    analysis = notes or "Submitted via backlog"
-
-    cmd = [
-        str(REPO_ROOT / 'bin' / 'update-ideas-log'),
-        '--title', idea_title,
-        '--analysis', analysis,
-        '--auto-confirm',
-    ]
-
-    if dry_run:
-        print(f"  [dry-run] Would run: {' '.join(cmd)}")
-        return True
-
-    print(f"  Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, text=True, capture_output=True)
-    if result.stdout.strip():
-        print(result.stdout.strip())
-    if result.returncode != 0:
-        print(f"  ERROR: ideas handler failed (exit {result.returncode})", file=sys.stderr)
-        if result.stderr.strip():
-            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
-        return False
-    return True
-
-
 def run_tasks(title_rest, notes, dry_run):
     """Run the tasks handler. Creates a task on the todo list. Returns True on success."""
     task_title = title_rest or "Untitled task"
@@ -205,7 +177,7 @@ def complete_task(task_id, dry_run):
 
 
 def process_task(task, dry_run):
-    """Process a single backlog task. Returns (success, is_followup)."""
+    """Process a single backlog task. Returns (success, is_followup, is_idea)."""
     title = task.get('title', '').strip()
     task_id = task.get('id', '')
     notes = task.get('notes', '').strip()
@@ -214,29 +186,30 @@ def process_task(task, dry_run):
 
     if keyword is None:
         # No keyword -- create follow-up for clarification
-        return create_followup(title, "No routing keyword found in task title", dry_run), True
+        return create_followup(title, "No routing keyword found in task title", dry_run), True, False
 
     if keyword.startswith('skill:'):
         skill_name = keyword[len('skill:'):]
         if skill_name in SKILL_ROUTES:
-            return run_skill(skill_name, dry_run), False
+            return run_skill(skill_name, dry_run), False, False
         else:
-            return create_followup(title, f"Unknown skill: {skill_name}", dry_run), True
+            return create_followup(title, f"Unknown skill: {skill_name}", dry_run), True, False
 
-    if keyword == 'ideas':
-        return run_ideas(rest, notes, dry_run), False
+    if keyword in ('ideas', 'idea'):
+        # Ideas require Claude analysis -- skip and report for Claude to handle
+        return True, False, True
 
     if keyword in ('task', 'tasks'):
-        return run_tasks(rest, notes, dry_run), False
+        return run_tasks(rest, notes, dry_run), False, False
 
     if keyword == 'project':
-        return create_followup(title, "Project task requires user scoping", dry_run), True
+        return create_followup(title, "Project task requires user scoping", dry_run), True, False
 
     if keyword == 'support':
-        return create_followup(title, "Support task requires manual routing", dry_run), True
+        return create_followup(title, "Support task requires manual routing", dry_run), True, False
 
     # Unknown keyword -- create follow-up
-    return create_followup(title, f"Unknown keyword: [{keyword}]", dry_run), True
+    return create_followup(title, f"Unknown keyword: [{keyword}]", dry_run), True, False
 
 
 def main():
@@ -274,13 +247,26 @@ def main():
     completed = 0
     failed = 0
     followups = 0
+    skipped_ideas = []
 
     for task in tasks:
         title = task.get('title', '(No title)').strip()
         task_id = task.get('id', '')
+        notes = task.get('notes', '').strip()
         print(f"Processing: {title}")
 
-        success, is_followup = process_task(task, dry_run)
+        success, is_followup, is_idea = process_task(task, dry_run)
+
+        if is_idea:
+            keyword, rest = parse_routing(title)
+            skipped_ideas.append({
+                'title': rest or title,
+                'notes': notes,
+                'task_id': task_id,
+            })
+            print(f"  Skipped (idea requires Claude analysis)")
+            print()
+            continue
 
         if is_followup:
             followups += 1
@@ -305,6 +291,16 @@ def main():
     if not dry_run and (completed > 0 or followups > 0):
         print("\nUpdating task list in daily log...")
         subprocess.run([str(REPO_ROOT / 'bin' / 'update-task-list'), '--auto-confirm'], text=True, capture_output=True)
+
+    # Step 5: Report skipped ideas
+    if skipped_ideas:
+        print(f"\n--- Ideas requiring analysis: {len(skipped_ideas)} task(s) ---")
+        for idea in skipped_ideas:
+            print(f"  Title: {idea['title']}")
+            if idea['notes']:
+                print(f"  Notes: {idea['notes']}")
+            print(f"  Task ID: {idea['task_id']}")
+            print()
 
 
 if __name__ == '__main__':

@@ -232,7 +232,7 @@ def cmd_list(args, config):
     list_id = get_list_id(config, args.list)
     print(f"Listing tasks on '{args.list}' list...\n")
 
-    params_dict = {'tasklist': list_id}
+    params_dict = {'tasklist': list_id, 'showAssigned': True}
     if not args.show_completed:
         params_dict['showCompleted'] = False
     params = json.dumps(params_dict)

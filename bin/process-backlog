@@ -62,7 +62,7 @@ def fetch_backlog_tasks(config):
         print("ERROR: config key 'backlogTaskListId' not found in daily_log.json", file=sys.stderr)
         sys.exit(1)
 
-    params = json.dumps({'tasklist': list_id, 'showCompleted': False})
+    params = json.dumps({'tasklist': list_id, 'showCompleted': False, 'showAssigned': True})
     stdout, _, _ = run_cmd(
         [str(GWS_SAFE), 'tasks', 'tasks', 'list', '--params', params]
     )

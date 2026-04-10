@@ -101,10 +101,14 @@ def fetch_calendar_events(week_start, week_end):
     week_start_iso = week_start.strftime("%Y-%m-%d")
     week_end_iso = week_end.strftime("%Y-%m-%d")
 
+    # Use local timezone offset for accurate day boundaries
+    local_offset = datetime.now(timezone.utc).astimezone().strftime("%z")
+    tz_str = f"{local_offset[:3]}:{local_offset[3:]}"  # e.g. "-06:00"
+
     params = {
         "calendarId": "primary",
-        "timeMin": f"{week_start_iso}T00:00:00Z",
-        "timeMax": f"{week_end_iso}T23:59:59Z",
+        "timeMin": f"{week_start_iso}T00:00:00{tz_str}",
+        "timeMax": f"{week_end_iso}T23:59:59{tz_str}",
         "singleEvents": True,
         "orderBy": "startTime",
     }

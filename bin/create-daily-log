@@ -165,6 +165,12 @@ def build_entry_text(today_heading, events, in_progress_tasks, waiting_tasks, ti
     # Empty line for user to type in
     add_line("", "NORMAL_TEXT")
 
+    # Agent Log heading
+    add_line("Agent Log:", "HEADING_2")
+
+    # Empty line (populated by publish-to-notes)
+    add_line("", "NORMAL_TEXT")
+
     # Notes heading
     add_line("Notes:", "HEADING_2")
 

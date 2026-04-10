@@ -42,6 +42,7 @@ SECTION_MAP = {
     "Random Fact:": "random_fact",
     "Email:": "email",
     "Thoughts / Ideas:": "thoughts_ideas",
+    "Agent Log:": "agent_log",
     "Notes:": "notes",
 }
 

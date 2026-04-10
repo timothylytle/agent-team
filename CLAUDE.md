@@ -69,6 +69,7 @@ Agents are defined in `.claude/agents/` and can be invoked using the Agent tool 
 | Publish to Notes | Publishes a timestamped message to the Notes section of today's daily log | `.claude/skills/publish-to-notes/SKILL.md` |
 | KPI | Generates weekly KPI report (Friday-Thursday) with helpdesk metrics, meetings, tasks, and support summary | `.claude/skills/kpi/SKILL.md` |
 | Project | Development Project Manager — creates, researches, and tracks development projects | `.claude/skills/project/SKILL.md` |
+| Tasks | Google Tasks management — creates, lists, completes, and moves tasks across all lists with CRM tracking | `.claude/skills/tasks/SKILL.md` |
 
 ## Hiring Process
 

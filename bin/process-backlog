@@ -125,6 +125,35 @@ def run_ideas(title_rest, notes, dry_run):
     return True
 
 
+def run_tasks(title_rest, notes, dry_run):
+    """Run the tasks handler. Creates a task on the in_progress list. Returns True on success."""
+    task_title = title_rest or "Untitled task"
+
+    cmd = [
+        str(MANAGE_TASKS), 'create',
+        '--list', 'in_progress',
+        '--title', task_title,
+        '--auto-confirm',
+    ]
+    if notes:
+        cmd += ['--notes', notes]
+
+    if dry_run:
+        print(f"  [dry-run] Would run: {' '.join(cmd)}")
+        return True
+
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        print(f"  ERROR: tasks handler failed (exit {result.returncode})", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
 def create_followup(original_title, reason, dry_run):
     """Create a follow-up task on the in_progress list. Returns True on success."""
     cmd = [
@@ -196,6 +225,9 @@ def process_task(task, dry_run):
 
     if keyword == 'ideas':
         return run_ideas(rest, notes, dry_run), False
+
+    if keyword in ('task', 'tasks'):
+        return run_tasks(rest, notes, dry_run), False
 
     if keyword == 'project':
         return create_followup(title, "Project task requires user scoping", dry_run), True
